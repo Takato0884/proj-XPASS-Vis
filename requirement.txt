@@ -1,0 +1,27 @@
+# Core deep learning
+torch
+torchvision
+open_clip_torch
+
+# Numerical / data
+numpy
+pandas
+scipy
+scikit-learn
+
+# Image / video
+Pillow
+opencv-python
+
+# Optimal transport (DeepJDOT / JUMBOT)
+POT
+
+# Training utilities
+tqdm
+wandb
+
+# LLM zero-shot inference
+anthropic
+openai
+google-genai
+python-dotenv

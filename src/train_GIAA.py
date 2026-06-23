@@ -1,0 +1,247 @@
+import os
+import copy
+
+import wandb
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+from .argflags import parse_arguments, model_dir, wandb_tags
+from .data import load_data, load_data_giaa_only, collate_fn
+from .train_common import NIMA, num_bins, parse_da_method
+from .inference import inference, inference_giaa
+
+_DA_METHOD_MODULES = {
+    'DANN':      '.methods.dann',
+    'DJDOT':     '.methods.djdot',
+    'JUMBOT':    '.methods.jumbot',
+    'DEEPCORAL': '.methods.deepcoral',
+    'CDAN':      '.methods.cdan',
+    'ALDA':      '.methods.alda',
+}
+
+
+def _load_method(method_name):
+    import importlib
+    if method_name and method_name in _DA_METHOD_MODULES:
+        return importlib.import_module(_DA_METHOD_MODULES[method_name], package=__package__)
+    from .methods import source_only
+    return source_only
+
+
+def run_main(args):
+    is_v_giaa = args.giaa_mode
+    batch_size = args.batch_size
+    print(args, flush=True)
+
+    method_name, target_genre = parse_da_method(args.da_method)
+    method = _load_method(method_name)
+    use_da = method_name is not None
+    domain_tag = f'{args.genre}2{target_genre}' if use_da else args.genre
+    _backbone_abbr = {'resnet50': 'RN50', 'i3d': 'I3D', 'vit_b_16': 'ViT',
+                      'clip_rn50': 'CLRN50', 'clip_vit_b16': 'CLViT'}
+    backbone_suffix = f'_{_backbone_abbr[args.backbone]}' if args.backbone in _backbone_abbr else ''
+    method_tag = (method_name if method_name else 'Only') + backbone_suffix
+
+    if args.is_log:
+        tags = ["GIAA"] + wandb_tags(args)
+        if use_da:
+            tags += [method_name, domain_tag]
+        wandb.init(project=args.wandb_project, notes="NIMA", tags=tags)
+        wandb.config = {
+            "learning_rate": args.lr,
+            "batch_size": batch_size,
+            "num_epochs": args.num_epochs,
+        }
+        experiment_name = f"{domain_tag}_{method_tag}_PAA({wandb.run.name})"
+        model_basename = f'{domain_tag}_{method_tag}_NIMA_{wandb.run.name}.pth'
+    else:
+        experiment_name = ''
+        model_basename = f'{domain_tag}_{method_tag}_NIMA_default.pth'
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dirname = os.path.join(model_dir(args), domain_tag)
+    best_modelname = os.path.join(dirname, model_basename)
+
+    model = NIMA(num_bins, backbone=args.backbone, dropout=args.dropout).to(device)
+    model.freeze_backbone()
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    components = method.setup(model, args, device)
+
+    if is_v_giaa:
+        train_dataset, val_dataset, test_dataset = load_data_giaa_only(args)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                  num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        src_dataloaders = (train_loader, val_loader, test_loader)
+
+        tgt_loader, tgt_val_loader = _build_target_loaders_giaa_only(
+            args, target_genre, batch_size, use_da)
+
+        ALL_GENRES = ['art', 'fashion', 'scenery']
+        eval_genres = [g for g in ALL_GENRES if g != args.genre]
+        eval_datasets_dict = {}
+        print(f"Cross-domain evaluation targets: {eval_genres}")
+        for eval_genre in eval_genres:
+            args_copy = copy.deepcopy(args)
+            args_copy.genre = eval_genre
+            _, _, eval_test_giaa = load_data_giaa_only(args_copy)
+            eval_datasets_dict[eval_genre] = {'test': eval_test_giaa}
+            print(f"Loaded {len(eval_test_giaa)} GIAA test samples for cross-domain eval genre '{eval_genre}'")
+
+        method.trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname,
+                       components, tgt_val_loader=tgt_val_loader, tgt_genre=target_genre)
+
+        test_emd, test_srocc, test_mse, test_mae, test_ccc = inference_giaa(
+            test_dataset, args, device, model, model_path=best_modelname,
+            eval_datasets_dict=eval_datasets_dict)
+        if args.is_log:
+            wandb.log({
+                f"{args.genre}/Test EMD GIAA": test_emd,
+                f"{args.genre}/Test SROCC GIAA": test_srocc,
+                f"{args.genre}/Test CCC GIAA": test_ccc,
+                f"{args.genre}/Test MSE GIAA": test_mse,
+            })
+
+    else:
+        (train_giaa_dataset, train_piaa_dataset, _,
+         val_giaa_dataset, val_piaa_dataset, _,
+         test_piaa_dataset) = load_data(args)
+
+        train_giaa_loader = DataLoader(train_giaa_dataset, batch_size=batch_size, shuffle=True,
+                                       num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        val_giaa_loader = DataLoader(val_giaa_dataset, batch_size=batch_size, shuffle=False,
+                                     num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        test_piaa_loader = DataLoader(test_piaa_dataset, batch_size=batch_size, shuffle=False,
+                                      num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        src_dataloaders = (train_giaa_loader, val_giaa_loader, test_piaa_loader)
+
+        tgt_loader, tgt_val_loader = _build_target_loaders_full(
+            args, target_genre, batch_size, use_da)
+
+        ALL_GENRES = ['art', 'fashion', 'scenery']
+        eval_genres = [g for g in ALL_GENRES if g != args.genre]
+        eval_datasets_dict = {}
+        print(f"Cross-domain evaluation targets: {eval_genres}")
+        for eval_genre in eval_genres:
+            args_copy = copy.deepcopy(args)
+            args_copy.genre = eval_genre
+            _, _, _, _, _, _, eval_test_piaa = load_data(args_copy)
+            eval_datasets_dict[eval_genre] = {'test': eval_test_piaa}
+            print(f"Loaded {len(eval_test_piaa)} test samples for cross-domain eval genre '{eval_genre}'")
+
+        method.trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname,
+                       components, tgt_val_loader=tgt_val_loader, tgt_genre=target_genre)
+
+        inference(train_piaa_dataset, val_piaa_dataset, test_piaa_dataset,
+                  args, device, model, eval_split="Val",
+                  experiment_name=experiment_name, model_path=best_modelname)
+        inference(train_piaa_dataset, val_piaa_dataset, test_piaa_dataset,
+                  args, device, model, eval_split="Test",
+                  experiment_name=experiment_name, model_path=best_modelname,
+                  eval_datasets_dict=eval_datasets_dict)
+
+    if args.is_log:
+        wandb.finish()
+
+
+def _build_target_loaders_giaa_only(args, target_genre, batch_size, use_da):
+    if use_da:
+        args_tgt = copy.deepcopy(args)
+        args_tgt.genre = target_genre
+        tgt_train, tgt_val, _ = load_data_giaa_only(args_tgt)
+        tgt_loader = DataLoader(tgt_train, batch_size=batch_size, shuffle=True,
+                                num_workers=args.num_workers, timeout=300,
+                                collate_fn=collate_fn, drop_last=True)
+        tgt_val_loader = DataLoader(tgt_val, batch_size=batch_size, shuffle=False,
+                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        return tgt_loader, tgt_val_loader
+
+    eval_target = getattr(args, 'eval_target', None)
+    if eval_target:
+        args_tgt = copy.deepcopy(args)
+        args_tgt.genre = eval_target
+        _, tgt_val, _ = load_data_giaa_only(args_tgt)
+        tgt_val_loader = DataLoader(tgt_val, batch_size=batch_size, shuffle=False,
+                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        return None, tgt_val_loader
+
+    return None, None
+
+
+def _build_target_loaders_full(args, target_genre, batch_size, use_da):
+    if use_da:
+        args_tgt = copy.deepcopy(args)
+        args_tgt.genre = target_genre
+        tgt_giaa, _, _, tgt_val_giaa, _, _, _ = load_data(args_tgt)
+        tgt_loader = DataLoader(tgt_giaa, batch_size=batch_size, shuffle=True,
+                                num_workers=args.num_workers, timeout=300,
+                                collate_fn=collate_fn, drop_last=True)
+        tgt_val_loader = DataLoader(tgt_val_giaa, batch_size=batch_size, shuffle=False,
+                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        return tgt_loader, tgt_val_loader
+
+    eval_target = getattr(args, 'eval_target', None)
+    if eval_target:
+        args_tgt = copy.deepcopy(args)
+        args_tgt.genre = eval_target
+        _, _, _, tgt_val_giaa, _, _, _ = load_data(args_tgt)
+        tgt_val_loader = DataLoader(tgt_val_giaa, batch_size=batch_size, shuffle=False,
+                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        return None, tgt_val_loader
+
+    return None, None
+
+
+from .train_common import discover_folds
+
+if __name__ == '__main__':
+    args = parse_arguments()
+
+    ALL_GENRES = ['art', 'fashion', 'scenery']
+    if args.genre == 'all':
+        source_genres = list(ALL_GENRES)
+        print(f"--genre all: running sources sequentially: {source_genres}")
+    else:
+        source_genres = [args.genre]
+    base_da_method = args.da_method
+
+    for source in source_genres:
+        args_src = copy.deepcopy(args)
+        args_src.genre = source
+        if len(source_genres) > 1:
+            print(f"\n{'@'*60}\n  Source genre: {source}\n{'@'*60}\n")
+
+        if base_da_method and '-' not in base_da_method:
+            target_genres = [g for g in ALL_GENRES if g != source]
+            print(f"Bare --da_method '{base_da_method}': running targets sequentially: {target_genres}")
+        else:
+            target_genres = [None]
+
+        for target in target_genres:
+            args_outer = copy.deepcopy(args_src)
+            if target is not None:
+                args_outer.da_method = f'{base_da_method}-{target}'
+                print(f"\n{'#'*60}\n  Target genre: {target}  (da_method={args_outer.da_method})\n{'#'*60}\n")
+
+            if args_outer.dataset_ver.endswith('_all'):
+                version_prefix = args_outer.dataset_ver[:-4]
+                folds = discover_folds(args_outer.root_dir, version_prefix)
+                if not folds:
+                    raise ValueError(
+                        f"No fold directories found for version '{version_prefix}' in "
+                        f"{os.path.join(args_outer.root_dir, 'split')}")
+                print(f"Running all {len(folds)} folds sequentially: {folds}")
+                for i, fold in enumerate(folds):
+                    if i + 1 < args_outer.start_fold:
+                        print(f"Skipping fold {i+1}/{len(folds)}: {fold} (start_fold={args_outer.start_fold})")
+                        continue
+                    print(f"\n{'='*60}\n  Fold {i+1}/{len(folds)}: {fold}\n{'='*60}\n")
+                    args_fold = copy.deepcopy(args_outer)
+                    args_fold.dataset_ver = fold
+                    run_main(args_fold)
+            else:
+                run_main(args_outer)
