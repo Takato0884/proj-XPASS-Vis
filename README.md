@@ -15,7 +15,9 @@ XPASS-Vis is the first large-scale dataset for cross-domain Personalized Image A
   </a>
 </p>
 
-> 🔒 **About dataset access:** The dataset zip files are password-protected. Obtaining the password requires submitting an application form, but **the application form is currently being prepared (coming soon).** Please wait until it is released.
+> 📩 **Requesting the dataset:** If you would like to use the dataset, please contact **[hayashi0884@jaist.ac.jp](mailto:hayashi0884@jaist.ac.jp)**.
+
+> 🔒 **About dataset access:** The dataset zip files are password-protected. Obtaining the password requires submitting an application form, but **the application form is currently being prepared (coming soon).** In the meantime, please contact [hayashi0884@jaist.ac.jp](mailto:hayashi0884@jaist.ac.jp).
 
 ---
 
@@ -67,6 +69,8 @@ data/
     ├── scenery_image/   # scenery images
     └── scenery_video/   # scenery videos
 ```
+
+> **Dataset requests:** To obtain access, contact [hayashi0884@jaist.ac.jp](mailto:hayashi0884@jaist.ac.jp).
 
 > **Note:** The stimulus data folder is named `samples` (plural) (`src/data.py` references `{--root_dir}/samples/`). If you change `--root_dir`, place the data under it with the same structure.
 
