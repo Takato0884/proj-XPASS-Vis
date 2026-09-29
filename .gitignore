@@ -30,3 +30,7 @@ Thumbs.db
 
 # Environment
 .env
+
+# Local data and notes
+asset/
+note/
