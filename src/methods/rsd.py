@@ -9,7 +9,7 @@ from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from ..train_common import build_piaa_model, num_bins
+from ..train_common import fixed_epochs, build_piaa_model, num_bins
 from ..data import collate_fn
 from ..evaluate import evaluate_piaa
 
@@ -175,6 +175,9 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train feat_norm_tgt": norm_tgt,
             }, commit=False)
 
+        if fixed_epochs(args):
+            continue
+
         genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
         val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
 
@@ -219,6 +222,12 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
             if patience >= args.max_patience_epochs:
                 print(f"RSD Pretrain: early stopping at epoch {epoch}")
                 break
+
+    if fixed_epochs(args):
+        if args.no_save_model:
+            best_state_dict = copy.deepcopy(model.state_dict())
+        else:
+            torch.save(model.state_dict(), best_model_path)
 
     return best_model_path, best_state_dict
 
@@ -312,6 +321,9 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 model_user, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
                 epoch=epoch, desc_suffix=" finetune")
 
+            if fixed_epochs(args):
+                continue
+
             genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
 
@@ -355,3 +367,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 if patience >= args.max_patience_epochs:
                     print(f"User {uid}: early stopping at epoch {epoch}")
                     break
+
+        if fixed_epochs(args):
+            torch.save(model_user.state_dict(), best_model_path)

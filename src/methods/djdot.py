@@ -12,7 +12,7 @@ from tqdm import tqdm
 import copy
 from torch.utils.data import DataLoader
 
-from ..train_common import earth_mover_distance, build_piaa_model, num_bins
+from ..train_common import fixed_epochs, earth_mover_distance, build_piaa_model, num_bins
 from ..data import collate_fn
 from ..evaluate import evaluate, evaluate_piaa
 
@@ -143,6 +143,9 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
                 f"{args.genre}/Train L_feat Ratio":    L_feat_ratio,
             }, commit=False)
 
+        if fixed_epochs(args):
+            continue
+
         val_emd, val_srocc, _, val_mse, _, _, val_ccc = evaluate(
             model, val_loader, device, epoch=epoch, phase_name="Val")
         if args.is_log:
@@ -182,6 +185,10 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
             if patience >= args.max_patience_epochs:
                 print(f"Early stopping at epoch {epoch}")
                 break
+
+    if fixed_epochs(args):
+        os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
+        torch.save(model.state_dict(), best_modelname)
 
     model.load_state_dict(torch.load(best_modelname))
 
@@ -333,6 +340,9 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train L_feat Ratio": L_feat_ratio,
             }, commit=False)
 
+        if fixed_epochs(args):
+            continue
+
         genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
         val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
 
@@ -376,6 +386,12 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
             if patience >= args.max_patience_epochs:
                 print(f"DJDOT Pretrain: early stopping at epoch {epoch}")
                 break
+
+    if fixed_epochs(args):
+        if args.no_save_model:
+            best_state_dict = copy.deepcopy(model.state_dict())
+        else:
+            torch.save(model.state_dict(), best_model_path)
 
     return best_model_path, best_state_dict
 
@@ -482,6 +498,9 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             align_total = alpha * L_feat + lambda_t * L_label
             L_feat_ratio = (alpha * L_feat) / align_total if align_total > 0 else 0.0
 
+            if fixed_epochs(args):
+                continue
+
             genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
             val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
 
@@ -520,3 +539,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 if patience >= args.max_patience_epochs:
                     print(f"User {uid}: early stopping at epoch {epoch}")
                     break
+
+        if fixed_epochs(args):
+            torch.save(model_user.state_dict(), best_model_path)

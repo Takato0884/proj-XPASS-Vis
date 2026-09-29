@@ -34,3 +34,7 @@ Thumbs.db
 # Local data and notes
 asset/
 note/
+
+# Manuscript (LaTeX)
+manuscript/
+IEEE_Access_LaTeX_template.zip

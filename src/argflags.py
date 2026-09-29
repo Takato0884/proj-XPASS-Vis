@@ -28,6 +28,9 @@ def parse_arguments(parse=True):
     parser.add_argument('--lr_patience', type=int, default=5)
     parser.add_argument('--no_save_model', action='store_true', default=False,
                         help='If set, keep best model in memory instead of saving to disk')
+    parser.add_argument('--fixed_epochs', action='store_true', default=False,
+                        help='Train for exactly --num_epochs and keep the final checkpoint '
+                             '(no per-epoch validation, LR plateau schedule or early stopping).')
 
     parser.add_argument('--giaa_mode', action='store_true', default=False,
                         help='Use GIAA-only split files (train/val/test_images_GIAA.txt). '

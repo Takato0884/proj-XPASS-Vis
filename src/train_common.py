@@ -408,6 +408,15 @@ def parse_da_method(da_method: str):
     return None, None
 
 
+def fixed_epochs(args) -> bool:
+    """Train for exactly args.num_epochs and keep the final checkpoint.
+
+    Skips per-epoch validation, the plateau LR schedule and early stopping, so a
+    trial never queries validation data during training (R1-6 protocol).
+    """
+    return getattr(args, 'fixed_epochs', False)
+
+
 def get_da_lambda(epoch: int, total_steps: int, gamma: float = 10.0) -> float:
     p = min(epoch / max(total_steps, 1), 1.0)
     return 2.0 / (1.0 + math.exp(-gamma * p)) - 1.0

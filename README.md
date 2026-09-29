@@ -27,6 +27,7 @@ XPASS-Vis is the first large-scale dataset for cross-domain Personalized Image A
 2. [Training (GIAA)](#giaa-general-image-aesthetic-assessment)
 3. [Domain Adaptation Methods](#domain-adaptation-methods)
 4. [Training (PIAA)](#piaa-pretraining--finetuning-ici--mir)
+   - [Group-Split Protocol (Random Search & Model Selection)](#group-split-protocol-random-search--model-selection)
 5. [Inference (Standalone)](#inference-standalone)
 6. [LLM Zero-Shot Inference](#llm-zero-shot-inference)
 7. [Analysis Tools](#analysis-tools) ([fold aggregation](#fold-result-aggregation-aggregate))
@@ -253,6 +254,50 @@ python -m src.train_PIAA --genre scenery --dataset_ver v2_all \
 python -m src.train_PIAA --genre art --dataset_ver v2_all \
   --model_type MIR --piaa_mode PIAA_pretrain --batch_size 128
 ```
+
+---
+
+## Group-Split Protocol (Random Search & Model Selection)
+
+`src/sweep.py` tunes every method (Source-Only, Target-Only and the UDA methods) with the same procedure and the same number of trials, on a 10-group / 5-fold user split.
+
+### Split
+
+`python -m src.make_split --out_dir asset/split` builds the split from `asset/maked/ratings.csv`. It uses 10 groups, one per rating session, and each group has its own annotators and stimuli. Each fold tests on 2 groups, validates on 1 randomly drawn group, and trains on the remaining 7. Users and images never overlap across train, val and test. `fine_samples.csv` fixes 120 fine-tuning and 50 evaluation samples per user and domain.
+
+### Procedure
+
+The stages run in order. Each stage starts from the configuration selected in the previous stage.
+
+| Stage | Trained on | Selected by |
+|---|---|---|
+| GIAA | train users' score histograms | EMD on val users' images |
+| PIAA pre | train users' ratings | MSE on val users' ratings |
+| PIAA fine | each val user's 120 source samples | mean per-user SCC on their 50 eval samples |
+
+The test users are then fine-tuned with the selected configuration and scored on their target-domain eval samples.
+
+Two selection criteria are used (DomainBed):
+- `train_domain`: selects on the val users' source domain. This criterion gives the main results.
+- `oracle`: selects on the val users' target domain. This criterion is for reference only.
+
+Every trial trains for a fixed 20 epochs in every stage and is scored once, at its final checkpoint. There is no early stopping, and no validation during training. Unlabeled target data comes from the train groups only. At the fine stage, the train-group target images are paired with the fine-tuned user's own traits. Search ranges, epochs and the per-stage batch sizes are defined in `src/search_space.py`.
+
+### Example commands
+
+```bash
+# UDA method, one direction (both criteria)
+python -m src.sweep --fold 0 --method DANN --source art --target fashion --n_trials 20
+
+# Source-Only for every target of one source; Target-Only for one domain
+python -m src.sweep --fold 0 --method SourceOnly --source art --n_trials 20
+python -m src.sweep --fold 0 --method TargetOnly --target fashion --n_trials 20
+```
+
+- **Resuming and caching:** results are cached per trial under `--out_dir` (default `reports/r16`). Rerunning a command resumes where it stopped. Runs that share a stage reuse its trials; for example, DARE-GRAM and RSD reuse Source-Only's GIAA stage.
+- **Checkpoints:** only the best checkpoint per domain is kept under `--models_dir`.
+- **Final results:** they are written to `reports/r16/fold{k}/{ICI|MIR}/final/`.
+- **Data location:** `--root_dir` (default `data`) must contain `samples/`.
 
 ---
 

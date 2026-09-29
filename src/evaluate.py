@@ -209,6 +209,21 @@ def evaluate_piaa(model, dataloaders_dict, device, epoch: int = None, phase_name
     return genre_metrics, total_mae_loss
 
 
+def evaluate_piaa_mse(model, dataloader, device, head):
+    """Per-sample mean of the PIAA training loss (MSE on normalized scores), predicting with `head`."""
+    model.eval()
+    total, count = 0.0, 0
+    with torch.no_grad():
+        for sample in tqdm(dataloader, leave=False, desc=f"MSE [{head}]", ncols=120, ascii="-="):
+            images = sample['image'].to(device)
+            target = sample['Aesthetic'].to(device).view(-1, 1)
+            with autocast('cuda'):
+                outputs = model(images, sample['traits'].float().to(device), sample['QIP'].float().to(device), head)
+            total += F.mse_loss(outputs.view(-1, 1).float(), target, reduction='sum').item()
+            count += target.size(0)
+    return total / max(count, 1)
+
+
 def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
     model.eval()
     cross_domain_results = {}

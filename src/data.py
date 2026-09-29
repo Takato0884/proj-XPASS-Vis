@@ -11,10 +11,12 @@ from PIL import Image
 import cv2
 from tqdm import tqdm
 import pickle
+import hashlib
+import json
 from torchvision import transforms
 
-def build_global_encoders(root_dir, num_age_bins=5):
-    maked_dir = os.path.join(root_dir, 'maked')
+def build_global_encoders(root_dir, num_age_bins=5, maked_dir=None):
+    maked_dir = maked_dir or os.path.join(root_dir, 'maked')
     users = pd.read_csv(os.path.join(maked_dir, 'users.csv'))
 
     encoded_trait_columns = ['age', 'gender', 'edu', 'nationality', 'art_learn', 'fashion_learn', 'photoVideo_learn']
@@ -37,7 +39,7 @@ def build_global_encoders(root_dir, num_age_bins=5):
 
 class ImageDataset(Dataset):
     def __init__(self, root_dir, transform=None, genre=None, backbone=None, max_frames=None, is_train=False,
-                 global_trait_encoders=None, global_age_bins=None):
+                 global_trait_encoders=None, global_age_bins=None, maked_dir=None):
         self.genre = genre
         self.backbone = backbone
         self.use_image = (self.backbone != "i3d")
@@ -45,7 +47,7 @@ class ImageDataset(Dataset):
         self.transform = transform
         self.max_frames = max_frames
         self.is_train = is_train
-        self.maked_dir = os.path.join(root_dir, 'maked')
+        self.maked_dir = maked_dir or os.path.join(root_dir, 'maked')
 
         self.ratings_data = pd.read_csv(os.path.join(self.maked_dir, 'ratings.csv'))
         self.ratings_data = self.ratings_data[self.ratings_data['genre'] == self.genre]
@@ -509,9 +511,9 @@ def load_data_giaa_only(args):
 
 class Image_GIAA_HistogramDataset(ImageDataset):
     def __init__(self, root_dir, transform=None, genre=None, backbone=None, data=None, map_file=None, precompute_file=None, max_frames=None, is_train=False,
-                 global_trait_encoders=None, global_age_bins=None):
+                 global_trait_encoders=None, global_age_bins=None, maked_dir=None):
         super().__init__(root_dir, transform, genre, backbone=backbone, max_frames=max_frames, is_train=is_train,
-                         global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
+                         global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins, maked_dir=maked_dir)
         if data is not None:
             self.data = data
 
@@ -619,9 +621,9 @@ def collate_fn(batch):
 
 class Image_PIAA_HistogramDataset(ImageDataset):
     def __init__(self, root_dir, transform=None, data=None, genre=None, backbone=None, max_frames=None, is_train=False,
-                 global_trait_encoders=None, global_age_bins=None):
+                 global_trait_encoders=None, global_age_bins=None, maked_dir=None):
         super().__init__(root_dir, transform, genre=genre, backbone=backbone, max_frames=max_frames, is_train=is_train,
-                         global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
+                         global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins, maked_dir=maked_dir)
         if data is not None:
             self.data = data
 
@@ -674,3 +676,98 @@ class Image_PIAA_HistogramDataset(ImageDataset):
         accumulated_histogram['genre'] = self.genre
 
         return accumulated_histogram
+
+
+GENRES = ['art', 'fashion', 'scenery']
+
+
+def load_group_split(split_dir, fold):
+    """Read one fold of the group split written by src/make_split.py."""
+    fold_dir = os.path.join(split_dir, f'fold{fold}')
+
+    def _ids(name):
+        with open(os.path.join(fold_dir, f'{name}.txt')) as f:
+            return [int(x) for x in f.read().split()]
+
+    split = {name: _ids(name) for name in ['train_users', 'val_users', 'test_users', 'giaa_train_images']}
+    split['fine'] = pd.read_csv(os.path.join(split_dir, 'fine_samples.csv'))
+    split['fold'] = fold
+    # Cache key for precomputed GIAA histograms; changes whenever the split does.
+    key = json.dumps([split['train_users'], split['val_users'], split['giaa_train_images']])
+    split['tag'] = hashlib.md5(key.encode()).hexdigest()[:8]
+    return split
+
+
+class GroupSplitData:
+    """Datasets of one genre for one fold of the group split.
+
+    GIAA: per-image score histograms from train users (train) or val users (val).
+    PIAA pre: individual ratings of train users (train) or val users (val).
+    PIAA fine: each user's 'train' / 'eval' samples listed in fine_samples.csv.
+    """
+
+    def __init__(self, args, genre, split, global_trait_encoders=None, global_age_bins=None):
+        self.args = args
+        self.genre = genre
+        self.split = split
+        self.train_transform, self.test_transform = get_transforms(args.backbone)
+        self.enc_kwargs = dict(global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins,
+                               maked_dir=args.maked_dir)
+        base = ImageDataset(args.root_dir, genre=genre, backbone=args.backbone, **self.enc_kwargs)
+        self.data = base.data
+        users_header = pd.read_csv(os.path.join(base.maked_dir, 'users.csv'), nrows=0).columns
+        self.user_columns = [c for c in self.data.columns
+                             if c == 'user_id' or c.removesuffix('_x').removesuffix('_y') in users_header]
+        self.train_max_frames = None if args.backbone == 'i3d' else 16
+        self.pkl_dir = os.path.join(args.root_dir, 'cash', f"group_{split['tag']}", f"fold{split['fold']}", genre)
+        self._giaa = {}
+        self._pre = {}
+
+    def _rows(self, users):
+        return self.data[self.data['user_id'].isin(users)]
+
+    def giaa(self, role):
+        if role not in self._giaa:
+            is_train = role == 'train'
+            rows = self._rows(self.split['train_users'] if is_train else self.split['val_users'])
+            if is_train:
+                rows = rows[rows['sample_id'].isin(self.split['giaa_train_images'])]
+            ensure_dir_exists(self.pkl_dir)
+            self._giaa[role] = Image_GIAA_HistogramDataset(
+                self.args.root_dir, transform=self.train_transform if is_train else self.test_transform,
+                genre=self.genre, backbone=self.args.backbone, data=rows.reset_index(drop=True),
+                map_file=os.path.join(self.pkl_dir, f'giaa_{role}_map.pkl'),
+                precompute_file=os.path.join(self.pkl_dir, f'giaa_{role}_hist.pkl'),
+                max_frames=self.train_max_frames if is_train else None, is_train=is_train, **self.enc_kwargs)
+        return self._giaa[role]
+
+    def piaa(self, rows, is_train):
+        return Image_PIAA_HistogramDataset(
+            self.args.root_dir, transform=self.train_transform if is_train else self.test_transform,
+            data=rows.reset_index(drop=True), genre=self.genre, backbone=self.args.backbone,
+            max_frames=self.train_max_frames if is_train else None, is_train=is_train, **self.enc_kwargs)
+
+    def pre(self, role):
+        if role not in self._pre:
+            is_train = role == 'train'
+            users = self.split['train_users'] if is_train else self.split['val_users']
+            self._pre[role] = self.piaa(self._rows(users), is_train)
+        return self._pre[role]
+
+    def fine(self, users, role):
+        fine = self.split['fine']
+        keys = fine[(fine['genre'] == self.genre) & (fine['role'] == role) & fine['user_id'].isin(users)]
+        rows = self.data.merge(keys[['user_id', 'sample_id']], on=['user_id', 'sample_id'], how='inner')
+        return self.piaa(rows, is_train=role == 'train')
+
+    def unlabeled_personal(self, users):
+        """Train-group images of this genre, each paired with every given user's traits.
+
+        Unlabeled target data for fine-stage adaptation. The images come from the
+        train groups only, so no val/test image is used for adaptation (R2-2).
+        DA losses never read target labels; Aesthetic is zeroed to make that explicit.
+        """
+        images = self._rows(self.split['train_users']).drop_duplicates('sample_id')
+        images = images.drop(columns=self.user_columns).assign(Aesthetic=0)
+        people = self._rows(users).drop_duplicates('user_id')[self.user_columns]
+        return self.piaa(images.merge(people, how='cross')[self.data.columns], is_train=True)
