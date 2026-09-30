@@ -30,7 +30,7 @@ chains that share a stage (e.g. Source-Only for two targets) reuse its trials.
 Only the best checkpoint per domain of interest is kept.
 
 Outputs go under --out_dir (default output/r16):
-    results/fold{k}/      per-trial JSON records and final/ (selected configs, test SCC)
+    results/fold{k}/      per-trial JSON records and final/ (selected configs, test SCC and CCC)
     predictions/fold{k}/  per-sample test-user predictions (CSV)
     logs/fold{k}/         console log of each command
 Checkpoints go under --models_dir.
@@ -338,7 +338,8 @@ class Sweep:
                 result = self._fine_users(key, pre, hp, self.split['val_users'], seed)
                 record = {'stage': 'fine', 'key': _key_name(key), 'base': _pre_id(pre), 'trial': t, 'seed': seed,
                           'hparams': hp, 'metric': 'mean per-user SCC on val users eval samples',
-                          'val_scc': result['scc'], 'per_user': result['per_user']}
+                          'val_scc': result['scc'], 'val_ccc': result['ccc'], 'per_user': result['per_user'],
+                          'per_user_ccc': result['per_user_ccc']}
                 _write_json(path, record)
             records.append(record)
         return records
@@ -354,13 +355,14 @@ class Sweep:
             result = self._fine_users(key, pre, fine['hparams'], self.split['test_users'], fine['seed'],
                                       pred_path=pred_path)
             record = {'stage': 'test', 'key': _key_name(key), 'base': _pre_id(pre), 'fine_trial': fine['trial'],
-                      'hparams': fine['hparams'], 'metric': 'mean per-user SCC on test users eval samples',
-                      'test_scc': result['scc'], 'per_user': result['per_user'], 'predictions': pred_path}
+                      'hparams': fine['hparams'], 'metric': 'mean per-user SCC and CCC on test users eval samples',
+                      'test_scc': result['scc'], 'test_ccc': result['ccc'], 'per_user': result['per_user'],
+                      'per_user_ccc': result['per_user_ccc'], 'predictions': pred_path}
             _write_json(path, record)
         return record
 
     def _fine_users(self, key, pre, hp, users, seed, pred_path=None):
-        """Fine-tune each user on their source 'train' samples; SCC on their 'eval' samples per domain.
+        """Fine-tune each user on their source 'train' samples; SCC and CCC on their 'eval' samples per domain.
 
         With `pred_path`, the per-sample predictions are also written there as CSV.
         """
@@ -375,6 +377,7 @@ class Sweep:
         unlabeled_all = self.fine_set(tgt, users, 'unlabeled') if method != 'SourceOnly' else None
 
         per_user = {}
+        per_user_ccc = {}
         predictions = []
         for uid in users:
             _seed_everything(_stable_seed(seed, uid))
@@ -394,11 +397,14 @@ class Sweep:
             model.load_state_dict(torch.load(ckpt))
             os.remove(ckpt)
             per_user[str(uid)] = {}
+            per_user_ccc[str(uid)] = {}
             for g in self.eval_genres(key):
                 eval_set = _subset(self.fine_set(g, users, 'eval'), uid)
                 loader = self.loader(eval_set, args.batch_size)
-                srocc = evaluate_piaa(model, {src: loader}, self.device, phase_name=f'SCC u{uid} [{g}]')[0][src]['srocc']
+                metrics = evaluate_piaa(model, {src: loader}, self.device, phase_name=f'SCC u{uid} [{g}]')[0][src]
+                srocc = metrics['srocc']
                 per_user[str(uid)][g] = None if np.isnan(srocc) else float(srocc)
+                per_user_ccc[str(uid)][g] = float(metrics['ccc'])
                 if pred_path:
                     out = model._eval_predictions[src]
                     rows = eval_set.data[['user_id', 'sample_id', 'sample_file']].assign(
@@ -414,7 +420,8 @@ class Sweep:
         # An undefined SCC (constant prediction) counts as 0 in the mean; per_user keeps it as null.
         scc = {g: float(np.mean([v[g] if v[g] is not None else 0.0 for v in per_user.values()]))
                for g in self.eval_genres(key)}
-        return {'scc': scc, 'per_user': per_user}
+        ccc = {g: float(np.mean([v[g] for v in per_user_ccc.values()])) for g in self.eval_genres(key)}
+        return {'scc': scc, 'ccc': ccc, 'per_user': per_user, 'per_user_ccc': per_user_ccc}
 
     # ---------- chains ----------
 
@@ -449,7 +456,9 @@ class Sweep:
             'selected': {'giaa': dict(stage(giaa, 'val_loss'), key=giaa['key']),
                          'pre': stage(pre, 'val_loss'), 'fine': stage(fine, 'val_scc')},
             'test_scc': test['test_scc'],
+            'test_ccc': test['test_ccc'],
             'per_user': test['per_user'],
+            'per_user_ccc': test['per_user_ccc'],
             'predictions': test.get('predictions'),
         }
 
@@ -464,7 +473,8 @@ class Sweep:
             result.update(method='TargetOnly', source=cli.target, target=cli.target, criterion='target')
             path = os.path.join(self.report_dir, cli.model_type, 'final', f'TargetOnly_{cli.target}.json')
             _write_json(path, result)
-            print(f"TargetOnly {cli.target}: test SCC = {result['test_scc'][cli.target]:.4f} -> {path}")
+            print(f"TargetOnly {cli.target}: test SCC = {result['test_scc'][cli.target]:.4f}, "
+                  f"CCC = {result['test_ccc'][cli.target]:.4f} -> {path}")
             return
         targets = [cli.target] if cli.target else [g for g in GENRES if g != cli.source]
         for tgt in targets:
