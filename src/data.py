@@ -143,6 +143,8 @@ class ImageDataset(Dataset):
             del sample[trait]
 
         sample_file = self.data.iloc[idx]['sample_file']
+        features = getattr(self, 'features', None)
+        feature = features[sample_file] if features is not None else None
         if self.genre == 'scenery':
             if self.use_image and sample_file.endswith('.mp4'):
                 sample_file = sample_file.replace('.mp4', '.jpg')
@@ -152,7 +154,10 @@ class ImageDataset(Dataset):
         sample['sample_path'] = sample_path
         sample['sample_file'] = sample_file
 
-        if self.use_image:
+        if feature is not None:
+            # Cached frozen-backbone features replace the image (and its augmentation).
+            sample['image'] = feature
+        elif self.use_image:
             sample['image'] = Image.open(sample_path).convert('RGB')
             if self.transform:
                 sample['image'] = self.transform(sample['image'])
@@ -630,6 +635,15 @@ class Image_PIAA_HistogramDataset(ImageDataset):
     def __getitem__(self, idx):
         max_response_score = 7
 
+        # With cached features an item depends only on its row, so it is built once per dataset.
+        # GroupSplitData fills the memo up front; loader workers inherit it, and copy.copy subsets share it.
+        memo = getattr(self, 'memo', None)
+        if memo is not None:
+            row = self.data.iloc[idx]
+            key = (row['user_id'], row['sample_file'])
+            if key in memo:
+                return memo[key]
+
         sample = super().__getitem__(idx)
 
         round_score = int(sample['Aesthetic'])
@@ -675,10 +689,48 @@ class Image_PIAA_HistogramDataset(ImageDataset):
 
         accumulated_histogram['genre'] = self.genre
 
+        if memo is not None:
+            memo[key] = accumulated_histogram
         return accumulated_histogram
 
 
 GENRES = ['art', 'fashion', 'scenery']
+FEATURE_BACKBONES = ('clip_rn50', 'clip_vit_b16')
+
+
+def load_image_features(root_dir, backbone, genre, maked_dir=None, device=None, batch_size=64):
+    """Frozen-backbone features of every stimulus of `genre`, keyed by sample_file.
+
+    Computed once with the test transform (no augmentation) and cached under
+    <root_dir>/cash/features/. PIAA models keep the backbone frozen, so feeding these
+    features gives the same forward pass as the image without the augmentation.
+    """
+    path = os.path.join(root_dir, 'cash', 'features', f'{backbone}_{genre}.pt')
+    if os.path.exists(path):
+        return torch.load(path)
+    from torch.amp import autocast
+    from .train_common import NIMA, num_bins
+
+    _, test_transform = get_transforms(backbone)
+    base = ImageDataset(root_dir, transform=test_transform, genre=genre, backbone=backbone, maked_dir=maked_dir)
+    files = sorted(base.data['sample_file'].unique())
+    device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    net = NIMA(num_bins, backbone=backbone).backbone.to(device).eval()
+    features = {}
+    for i in tqdm(range(0, len(files), batch_size), desc=f'Features [{backbone} {genre}]', ncols=120):
+        chunk = files[i:i + batch_size]
+        images = []
+        for f in chunk:
+            name = f.replace('.mp4', '.jpg') if genre == 'scenery' else f
+            sub = '' if genre == 'scenery' else genre
+            images.append(test_transform(Image.open(os.path.join(base.samples_dir, sub, name)).convert('RGB')))
+        with torch.no_grad(), autocast(device.type):
+            out = net(torch.stack(images).to(device)).float().cpu()
+        features.update({f: v.clone() for f, v in zip(chunk, out)})
+    del net
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(features, path)
+    return features
 
 
 def load_group_split(split_dir, fold):
@@ -722,6 +774,9 @@ class GroupSplitData:
         self.pkl_dir = os.path.join(args.root_dir, 'cash', f"group_{split['tag']}", f"fold{split['fold']}", genre)
         self._giaa = {}
         self._pre = {}
+        self.features = None
+        if getattr(args, 'feature_cache', False) and args.backbone in FEATURE_BACKBONES:
+            self.features = load_image_features(args.root_dir, args.backbone, genre, maked_dir=args.maked_dir)
 
     def _rows(self, users):
         return self.data[self.data['user_id'].isin(users)]
@@ -742,10 +797,16 @@ class GroupSplitData:
         return self._giaa[role]
 
     def piaa(self, rows, is_train):
-        return Image_PIAA_HistogramDataset(
+        dataset = Image_PIAA_HistogramDataset(
             self.args.root_dir, transform=self.train_transform if is_train else self.test_transform,
             data=rows.reset_index(drop=True), genre=self.genre, backbone=self.args.backbone,
             max_frames=self.train_max_frames if is_train else None, is_train=is_train, **self.enc_kwargs)
+        if self.features is not None:
+            dataset.features = self.features
+            dataset.memo = {}
+            for i in range(len(dataset)):
+                dataset[i]
+        return dataset
 
     def pre(self, role):
         if role not in self._pre:

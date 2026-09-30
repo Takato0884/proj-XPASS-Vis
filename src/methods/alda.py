@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 from ..train_common import (
     fixed_epochs, earth_mover_distance, GradientReversalLayer, get_da_lambda,
-    build_piaa_model, num_bins, parse_da_method)
+    build_piaa_model, num_bins, parse_da_method, da_weight)
 from ..data import collate_fn
 from ..evaluate import evaluate, evaluate_piaa
 from .cdan import gaussian_soft_label
@@ -33,6 +33,11 @@ class ALDADiscriminator(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+def _reg_weight(args, default):
+    r = getattr(args, 'alda_reg_weight', None)
+    return default if r is None else float(r)
 
 
 def _compute_corrected_label(xi: torch.Tensor, y_onehot: torch.Tensor, K: int = num_bins) -> torch.Tensor:
@@ -139,10 +144,11 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
 
             L_Reg = F.cross_entropy(discriminator(domain_feat_src.detach()), y_s_idx)
 
-            loss = L_y + lambda_ * L_T + L_Adv + L_Reg
-            weighted_da = lambda_ * L_T + L_Adv + L_Reg
-            cls_total = L_y + lambda_ * L_T + L_Adv
-            disc_total = L_Adv + L_Reg
+            w, r = da_weight(args, 1.0), _reg_weight(args, 1.0)
+            loss = L_y + w * (lambda_ * L_T + L_Adv + r * L_Reg)
+            weighted_da = w * (lambda_ * L_T + L_Adv + r * L_Reg)
+            cls_total = L_y + w * (lambda_ * L_T + L_Adv)
+            disc_total = w * (L_Adv + r * L_Reg)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -226,7 +232,7 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
             disc_total = metrics['disc_total']
             ratio_Ly = L_y_avg / (L_y_avg + da_w) if (L_y_avg + da_w) > 0 else 0.0
             ratio_Ly_cls = L_y_avg / cls_total if cls_total > 0 else 0.0
-            ratio_Adv_disc = metrics['L_Adv'] / disc_total if disc_total > 0 else 0.0
+            ratio_Adv_disc = da_weight(args, 1.0) * metrics['L_Adv'] / disc_total if disc_total > 0 else 0.0
             wandb.log({
                 "epoch": epoch,
                 f"{args.genre}/Train EMD GIAA": metrics['train_emd'],
@@ -376,10 +382,11 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, discriminator, grl,
 
             L_Reg = F.cross_entropy(discriminator(I_ij_src.detach()), y_s_idx)
 
-            loss = L_y + 0.05 * (lambda_ * L_T + L_Adv + 0.1 * L_Reg)
-            weighted_da = 0.05 * (lambda_ * L_T + L_Adv + 0.1 * L_Reg)
-            cls_total = L_y + 0.05 * (lambda_ * L_T + L_Adv)
-            disc_total = 0.05 * (L_Adv + 0.1 * L_Reg)
+            w, r = da_weight(args, 0.05), _reg_weight(args, 0.1)
+            loss = L_y + w * (lambda_ * L_T + L_Adv + r * L_Reg)
+            weighted_da = w * (lambda_ * L_T + L_Adv + r * L_Reg)
+            cls_total = L_y + w * (lambda_ * L_T + L_Adv)
+            disc_total = w * (L_Adv + r * L_Reg)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -486,7 +493,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
         lambda_ = get_da_lambda(global_step, alda_total_steps, getattr(args, 'da_gamma', 10.0))
         ratio_Ly = L_y / (L_y + weighted_da) if (L_y + weighted_da) > 0 else 0.0
         ratio_Ly_cls = L_y / cls_total if cls_total > 0 else 0.0
-        ratio_Adv_disc = (0.05 * L_Adv) / disc_total if disc_total > 0 else 0.0
+        ratio_Adv_disc = (da_weight(args, 0.05) * L_Adv) / disc_total if disc_total > 0 else 0.0
 
         if args.is_log:
             wandb.log({
@@ -668,7 +675,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             lambda_ = get_da_lambda(global_step, alda_total_steps, getattr(args, 'da_gamma', 10.0))
             ratio_Ly = L_y / (L_y + weighted_da) if (L_y + weighted_da) > 0 else 0.0
             ratio_Ly_cls = L_y / cls_total if cls_total > 0 else 0.0
-            ratio_Adv_disc = (0.05 * L_Adv) / disc_total if disc_total > 0 else 0.0
+            ratio_Adv_disc = (da_weight(args, 0.05) * L_Adv) / disc_total if disc_total > 0 else 0.0
 
             if fixed_epochs(args):
                 continue

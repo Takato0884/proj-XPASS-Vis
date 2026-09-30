@@ -281,7 +281,7 @@ Two selection criteria are used (DomainBed):
 - `train_domain`: selects on the val users' source domain. This criterion gives the main results.
 - `oracle`: selects on the val users' target domain. This criterion is for reference only.
 
-Every trial trains for a fixed 20 epochs in every stage and is scored once, at its final checkpoint. There is no early stopping, and no validation during training. Unlabeled target data comes from the train groups only. At the fine stage, the train-group target images are paired with the fine-tuned user's own traits. Search ranges, epochs and the per-stage batch sizes are defined in `src/search_space.py`.
+Every trial trains for a fixed 20 epochs in every stage and is scored once, at its final checkpoint. There is no early stopping, and no validation during training. Unlabeled target data comes from the train groups only. At the fine stage, the train-group target images are paired with the fine-tuned user's own traits. Search ranges, epochs and the per-stage batch sizes are defined in `src/search_space.py`. Each stage runs 20 trials. Trial 0 uses the values adopted by the original papers. Hyperparameters that are not searched are fixed to the original papers' values.
 
 ### Example commands
 
@@ -294,10 +294,19 @@ python -m src.sweep --fold 0 --method SourceOnly --source art --n_trials 20
 python -m src.sweep --fold 0 --method TargetOnly --target fashion --n_trials 20
 ```
 
-- **Resuming and caching:** results are cached per trial under `--out_dir` (default `reports/r16`). Rerunning a command resumes where it stopped. Runs that share a stage reuse its trials; for example, DARE-GRAM and RSD reuse Source-Only's GIAA stage.
-- **Checkpoints:** only the best checkpoint per domain is kept under `--models_dir`.
-- **Final results:** they are written to `reports/r16/fold{k}/{ICI|MIR}/final/`.
+- **Outputs:** everything except checkpoints goes under `--out_dir` (default `output/r16`):
+
+  | Folder | Contents |
+  |---|---|
+  | `results/fold{k}/` | one JSON record per trial; `{ICI\|MIR}/final/` holds the selected configurations and the test SCC |
+  | `predictions/fold{k}/{ICI\|MIR}/` | per-sample predictions for the test users (CSV: `user_id, sample_id, sample_file, genre, true, pred`) |
+  | `logs/fold{k}/` | the console output of each command; progress bars are left out |
+
+- **Resuming and caching:** results are cached per trial. Rerunning a command resumes where it stopped. Runs that share a stage reuse its trials; for example, DARE-GRAM and RSD reuse Source-Only's GIAA stage.
+- **Checkpoints:** only the best checkpoint per domain is kept under `--models_dir` (default `models_pth/r16`).
 - **Data location:** `--root_dir` (default `data`) must contain `samples/`.
+- **Feature cache:** the backbone is frozen in PIAA, so the PIAA stages feed cached CLIP features instead of images. The features are computed once per domain with the test transform (no augmentation) and saved to `<root_dir>/cash/features/`. Pass `--no_feature_cache` to feed images instead.
+- **Partial runs:** `--stop_after {giaa,pre,fine}` stops the chain after that stage, without the test run or the final record. For example, `python -m src.sweep --fold 0 --method TargetOnly --target art --model_type ICI --stop_after pre`.
 
 ---
 

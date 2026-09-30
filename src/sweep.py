@@ -29,10 +29,17 @@ Results are cached per trial, so an interrupted run resumes where it stopped and
 chains that share a stage (e.g. Source-Only for two targets) reuse its trials.
 Only the best checkpoint per domain of interest is kept.
 
+Outputs go under --out_dir (default output/r16):
+    results/fold{k}/      per-trial JSON records and final/ (selected configs, test SCC)
+    predictions/fold{k}/  per-sample test-user predictions (CSV)
+    logs/fold{k}/         console log of each command
+Checkpoints go under --models_dir.
+
 Usage:
     python -m src.sweep --fold 0 --method DANN --source art --target fashion --n_trials 20
     python -m src.sweep --fold 0 --method SourceOnly --source art          # both targets
     python -m src.sweep --fold 0 --method TargetOnly --target fashion
+    python -m src.sweep --fold 0 --method TargetOnly --target fashion --stop_after pre
 """
 import argparse
 import copy
@@ -42,8 +49,11 @@ import json
 import math
 import os
 import random
+import sys
+import time
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -69,13 +79,17 @@ def parse_cli():
     parser.add_argument('--n_trials', type=int, default=20, help='Configurations per stage, common to all methods')
     parser.add_argument('--search_seed', type=int, default=0)
     parser.add_argument('--criteria', type=str, nargs='+', default=CRITERIA, choices=CRITERIA)
+    parser.add_argument('--no_feature_cache', action='store_true',
+                        help='Feed images to the frozen backbone in PIAA instead of cached features')
+    parser.add_argument('--stop_after', type=str, default=None, choices=['giaa', 'pre', 'fine'],
+                        help='Run the chain only up to this stage (no test run or final record)')
     parser.add_argument('--split_dir', type=str, default='asset/split')
     parser.add_argument('--maked_dir', type=str, default='asset/maked')
     parser.add_argument('--root_dir', type=str, default='data', help='Contains samples/ and the cash/ cache')
     parser.add_argument('--backbone', type=str, default='clip_vit_b16',
                         choices=['resnet50', 'vit_b_16', 'clip_rn50', 'clip_vit_b16'])
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--out_dir', type=str, default='reports/r16')
+    parser.add_argument('--out_dir', type=str, default='output/r16', help='Results, predictions and logs')
     parser.add_argument('--models_dir', type=str, default='models_pth/r16')
     cli = parser.parse_args()
     if cli.method == 'TargetOnly':
@@ -151,7 +165,8 @@ class Sweep:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.split = load_group_split(cli.split_dir, cli.fold)
         self.encoders = build_global_encoders(cli.root_dir, maked_dir=cli.maked_dir)
-        self.report_dir = os.path.join(cli.out_dir, f'fold{cli.fold}')
+        self.report_dir = os.path.join(cli.out_dir, 'results', f'fold{cli.fold}')
+        self.pred_dir = os.path.join(cli.out_dir, 'predictions', f'fold{cli.fold}')
         self.model_dir = os.path.join(cli.models_dir, f'fold{cli.fold}')
         self._data = {}
         self._fine_sets = {}
@@ -193,6 +208,7 @@ class Sweep:
         args.dataset_ver = f'group_fold{self.cli.fold}'
         args.is_log = False
         args.fixed_epochs = True
+        args.feature_cache = not self.cli.no_feature_cache
         args.no_save_model = False
         args.da_method = f'{method}-{target}' if method in DA_METHODS else None
         for name, value in (hp or {}).items():
@@ -333,15 +349,21 @@ class Sweep:
         record = _read_json(path)
         if record is None:
             print(f"\n[test] {_key_name(key)} on {_pre_id(pre)} fine trial {fine['trial']}")
-            result = self._fine_users(key, pre, fine['hparams'], self.split['test_users'], fine['seed'])
+            pred_path = os.path.join(self.pred_dir, self.cli.model_type, _key_name(key), _pre_id(pre),
+                                     f"fine-t{fine['trial']:03d}.csv")
+            result = self._fine_users(key, pre, fine['hparams'], self.split['test_users'], fine['seed'],
+                                      pred_path=pred_path)
             record = {'stage': 'test', 'key': _key_name(key), 'base': _pre_id(pre), 'fine_trial': fine['trial'],
                       'hparams': fine['hparams'], 'metric': 'mean per-user SCC on test users eval samples',
-                      'test_scc': result['scc'], 'per_user': result['per_user']}
+                      'test_scc': result['scc'], 'per_user': result['per_user'], 'predictions': pred_path}
             _write_json(path, record)
         return record
 
-    def _fine_users(self, key, pre, hp, users, seed):
-        """Fine-tune each user on their source 'train' samples; SCC on their 'eval' samples per domain."""
+    def _fine_users(self, key, pre, hp, users, seed, pred_path=None):
+        """Fine-tune each user on their source 'train' samples; SCC on their 'eval' samples per domain.
+
+        With `pred_path`, the per-sample predictions are also written there as CSV.
+        """
         method, src, tgt = key
         args = self.args(src, method, tgt, hp)
         num_attr, num_pt = self.dims(src)
@@ -353,6 +375,7 @@ class Sweep:
         unlabeled_all = self.fine_set(tgt, users, 'unlabeled') if method != 'SourceOnly' else None
 
         per_user = {}
+        predictions = []
         for uid in users:
             _seed_everything(_stable_seed(seed, uid))
             train = _subset(train_all, uid)
@@ -372,11 +395,21 @@ class Sweep:
             os.remove(ckpt)
             per_user[str(uid)] = {}
             for g in self.eval_genres(key):
-                loader = self.loader(_subset(self.fine_set(g, users, 'eval'), uid), args.batch_size)
+                eval_set = _subset(self.fine_set(g, users, 'eval'), uid)
+                loader = self.loader(eval_set, args.batch_size)
                 srocc = evaluate_piaa(model, {src: loader}, self.device, phase_name=f'SCC u{uid} [{g}]')[0][src]['srocc']
                 per_user[str(uid)][g] = None if np.isnan(srocc) else float(srocc)
+                if pred_path:
+                    out = model._eval_predictions[src]
+                    rows = eval_set.data[['user_id', 'sample_id', 'sample_file']].assign(
+                        genre=g, true=out['true'], pred=out['pred'])
+                    predictions.append(rows)
             del model
             self._release()
+
+        if pred_path:
+            os.makedirs(os.path.dirname(pred_path), exist_ok=True)
+            pd.concat(predictions, ignore_index=True).to_csv(pred_path, index=False)
 
         # An undefined SCC (constant prediction) counts as 0 in the mean; per_user keeps it as null.
         scc = {g: float(np.mean([v[g] if v[g] is not None else 0.0 for v in per_user.values()]))
@@ -386,17 +419,26 @@ class Sweep:
     # ---------- chains ----------
 
     def run_chain(self, method, src, tgt, criterion):
-        """Select giaa -> pre -> fine on `criterion`, then evaluate the test users."""
+        """Select giaa -> pre -> fine on `criterion`, then evaluate the test users.
+
+        With --stop_after, return None once that stage's trials are done.
+        """
         sel = src if criterion == 'train_domain' else tgt
         key = ('SourceOnly', src, None) if method == 'SourceOnly' else (method, src, tgt)
         giaa_key = ('SourceOnly', src, None) if method in NO_GIAA else key
 
         giaa_records = self.giaa_trials(giaa_key)
         giaa = _best(giaa_records, 'val_loss', sel, minimize=True)
+        if self.cli.stop_after == 'giaa':
+            return None
         pre_records = self.pre_trials(key, giaa)
         pre = _best(pre_records, 'val_loss', sel, minimize=True)
+        if self.cli.stop_after == 'pre':
+            return None
         fine_records = self.fine_trials(key, pre)
         fine = _best(fine_records, 'val_scc', sel, minimize=False)
+        if self.cli.stop_after == 'fine':
+            return None
         test = self.test_run(key, pre, fine)
 
         stage = lambda r, m: {'trial': r['trial'], 'hparams': r['hparams'], 'val': r[m][sel]}
@@ -408,6 +450,7 @@ class Sweep:
                          'pre': stage(pre, 'val_loss'), 'fine': stage(fine, 'val_scc')},
             'test_scc': test['test_scc'],
             'per_user': test['per_user'],
+            'predictions': test.get('predictions'),
         }
 
     def run(self):
@@ -415,6 +458,9 @@ class Sweep:
         if cli.method == 'TargetOnly':
             # Source-Only trained and selected on the target domain; one criterion.
             result = self.run_chain('SourceOnly', cli.target, None, 'train_domain')
+            if result is None:
+                print(f'TargetOnly {cli.target}: stopped after {cli.stop_after}')
+                return
             result.update(method='TargetOnly', source=cli.target, target=cli.target, criterion='target')
             path = os.path.join(self.report_dir, cli.model_type, 'final', f'TargetOnly_{cli.target}.json')
             _write_json(path, result)
@@ -424,6 +470,9 @@ class Sweep:
         for tgt in targets:
             for criterion in cli.criteria:
                 result = self.run_chain(cli.method, cli.source, tgt, criterion)
+                if result is None:
+                    print(f'{cli.method} {cli.source}->{tgt} [{criterion}]: stopped after {cli.stop_after}')
+                    continue
                 name = f'{cli.method}_{cli.source}2{tgt}_{criterion}.json'
                 path = os.path.join(self.report_dir, cli.model_type, 'final', name)
                 _write_json(path, result)
@@ -436,5 +485,40 @@ def _pre_id(record):
     return f"{record['base']}-pre-t{record['trial']:03d}"
 
 
+class _Tee:
+    """Copy a stream to a log file; progress-bar redraws (lines with '\r') stay on the console only."""
+
+    def __init__(self, stream, log, skip_redraws):
+        self.stream, self.log, self.skip_redraws = stream, log, skip_redraws
+
+    def write(self, text):
+        self.stream.write(text)
+        if not (self.skip_redraws and '\r' in text):
+            self.log.write(text)
+            self.log.flush()
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def _start_log(cli):
+    name = cli.method if cli.method == 'TargetOnly' else f'{cli.method}_{cli.source}'
+    name += f'2{cli.target}' if cli.target and cli.method != 'TargetOnly' else ''
+    name += f'_{cli.target}' if cli.method == 'TargetOnly' else ''
+    path = os.path.join(cli.out_dir, 'logs', f'fold{cli.fold}',
+                        f"{name}_{cli.model_type}_{time.strftime('%Y%m%d-%H%M%S')}.log")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    log = open(path, 'a', buffering=1)
+    log.write(f"$ python -m src.sweep {' '.join(sys.argv[1:])}\n")
+    sys.stdout = _Tee(sys.stdout, log, skip_redraws=False)
+    sys.stderr = _Tee(sys.stderr, log, skip_redraws=True)
+    print(f'Log: {path}')
+
+
 if __name__ == '__main__':
-    Sweep(parse_cli()).run()
+    cli = parse_cli()
+    _start_log(cli)
+    Sweep(cli).run()

@@ -46,6 +46,11 @@ def parse_arguments(parse=True):
     parser.add_argument('--da_schedule_epochs', type=int, default=50,
                         help='[DA] λ schedule: number of epochs over which λ reaches ~1.0. '
                              'Converted internally to total_steps = da_schedule_epochs × (data_size / batch_size).')
+    parser.add_argument('--da_weight', type=float, default=None,
+                        help='[DANN/CDAN/ALDA] Weight of the adversarial loss. Default: 1.0 for GIAA, '
+                             '0.1 (DANN/CDAN) / 0.05 (ALDA) for PIAA.')
+    parser.add_argument('--alda_reg_weight', type=float, default=None,
+                        help='[ALDA] Weight of L_Reg in the discriminator loss. Default: 1.0 for GIAA, 0.1 for PIAA.')
     parser.add_argument('--da_gamma', type=float, default=10.0,
                         help='[DA] λ schedule: sharpness of the sigmoid (Ganin et al.)')
     parser.add_argument('--djdot_alpha', type=float, default=0.1,

@@ -152,6 +152,7 @@ def evaluate_piaa(model, dataloaders_dict, device, epoch: int = None, phase_name
 
     genre_metrics = {}
     total_mae_loss = 0.0
+    model._eval_predictions = {}
 
     for genre in dataloaders_dict.keys():
         if len(genre_predictions[genre]) == 0:
@@ -160,6 +161,8 @@ def evaluate_piaa(model, dataloaders_dict, device, epoch: int = None, phase_name
         predicted_scores = np.concatenate(genre_predictions[genre], axis=0)
         true_scores = np.concatenate(genre_targets[genre], axis=0)
         user_ids = genre_user_ids[genre]
+        # Per-sample outputs in loader order, for callers that save predictions.
+        model._eval_predictions[genre] = {'pred': predicted_scores, 'true': true_scores, 'user_id': user_ids}
         if len(user_ids) == 0:
             raise ValueError(
                 f"No user_id found for genre '{genre}'. "

@@ -63,7 +63,7 @@ class NIMA(nn.Module):
             backbone_out_features = 1024
 
         elif backbone == 'clip_vit_b16':
-            clip_model, _, _ = open_clip.create_model_and_transforms('ViT-B-16', pretrained='openai')
+            clip_model, _, _ = open_clip.create_model_and_transforms('ViT-B-16-quickgelu', pretrained='openai')
             self.backbone = clip_model.visual.float()
             backbone_out_features = 512
 
@@ -101,7 +101,8 @@ class NIMA(nn.Module):
         return self
 
     def forward(self, x, return_feat=False):
-        raw_feat = self.backbone(x)
+        # A 2-D input is a batch of cached backbone features (see data.load_image_features).
+        raw_feat = x if x.dim() == 2 else self.backbone(x)
         domain_feat = self.feat_proj(raw_feat)
         aesthetic_logits = self.fc_aesthetic(domain_feat)
         if return_feat:
@@ -415,6 +416,12 @@ def fixed_epochs(args) -> bool:
     trial never queries validation data during training (R1-6 protocol).
     """
     return getattr(args, 'fixed_epochs', False)
+
+
+def da_weight(args, default: float) -> float:
+    """Adversarial loss weight: --da_weight when set, else the method's per-stage default."""
+    w = getattr(args, 'da_weight', None)
+    return default if w is None else float(w)
 
 
 def get_da_lambda(epoch: int, total_steps: int, gamma: float = 10.0) -> float:

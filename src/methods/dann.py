@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 
 from ..train_common import (
     fixed_epochs, earth_mover_distance, GradientReversalLayer, DomainDiscriminator, get_da_lambda,
-    build_piaa_model, num_bins, parse_da_method)
+    build_piaa_model, num_bins, parse_da_method, da_weight)
 from ..data import collate_fn
 from ..evaluate import evaluate, evaluate_piaa
 
@@ -65,7 +65,7 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
             ], dim=0).to(device)
             domain_logit = discriminator(grl(feat_all, lambda_))
             L_d = F.binary_cross_entropy_with_logits(domain_logit, domain_labels)
-            loss = L_y + L_d
+            loss = L_y + da_weight(args, 1.0) * L_d
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -234,7 +234,7 @@ def _train_one_epoch_pretrain_piaa(model, src_loader, tgt_loader, discriminator,
             ], dim=0).to(device)
             domain_logit = discriminator(grl(feat_all, lambda_))
             L_d = F.binary_cross_entropy_with_logits(domain_logit, domain_labels)
-            loss = L_y + 0.1 * L_d
+            loss = L_y + da_weight(args, 0.1) * L_d
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -311,7 +311,7 @@ def _train_one_epoch_finetune_piaa(model, src_loader, tgt_loader, discriminator,
             ], dim=0).to(device)
             domain_logit = discriminator(grl(feat_all, lambda_))
             L_d = F.binary_cross_entropy_with_logits(domain_logit, domain_labels)
-            loss = L_y + 0.1 * L_d
+            loss = L_y + da_weight(args, 0.1) * L_d
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
