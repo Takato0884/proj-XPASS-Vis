@@ -24,8 +24,8 @@ import random
 
 STAGES = ['giaa', 'pre', 'fine']
 
-# Fixed per stage (not searched). Batch sizes follow the previous runs.
-BATCH_SIZE = {'giaa': 32, 'pre': 128, 'fine': 16}
+# Fixed per stage (not searched). pre uses 256 (cached backbone features make 128 step-bound).
+BATCH_SIZE = {'giaa': 32, 'pre': 256, 'fine': 16}
 NUM_EPOCHS = {'giaa': 20, 'pre': 20, 'fine': 20}
 
 COMMON = {'lr': ('log', 1e-7, 1e-2)}
