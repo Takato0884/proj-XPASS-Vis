@@ -11,8 +11,8 @@ and the test users are then fine-tuned with the selected configuration and
 scored on their target-domain eval samples.
 
 Two selection criteria (Gulrajani & Lopez-Paz, DomainBed, 2020):
-    train_domain  val users' source-domain data  (main results)
-    oracle        val users' target-domain data  (reference)
+    oracle        val users' target-domain data  (main results; test-domain validation)
+    train_domain  val users' source-domain data  (appendix; training-domain validation)
 
 Every trial trains for a fixed number of epochs and is scored once, at its final
 checkpoint, on every domain of interest, so both criteria select from the same
