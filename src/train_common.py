@@ -202,14 +202,13 @@ class Interfusion_GRU(nn.Module):
 
 
 class PIAA_ICI_CrossDomain(nn.Module):
-    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=256, dropout=None, use_da=False):
+    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=256, dropout=None):
         super(PIAA_ICI_CrossDomain, self).__init__()
         self.num_bins = num_bins
         self.num_attr = num_attr
         self.num_pt = num_pt
         self.genres = genres
         self.input_dim = input_dim
-        self.use_da = use_da
 
         self.nima_dict = nn.ModuleDict()
         for genre in genres:
@@ -228,8 +227,7 @@ class PIAA_ICI_CrossDomain(nn.Module):
         self.node_attr_img = MLP(num_attr + input_dim, hidden_size, num_attr * input_dim, dropout=_dropout)
 
         self.attr_corr = nn.Linear(input_dim, 1)
-        if not use_da:
-            self.direct_fc = nn.Linear(num_bins, 1)
+        self.direct_fc = nn.Linear(num_bins, 1)
 
         self.backbone_image_proj = nn.ModuleDict()
         for genre in genres:
@@ -287,11 +285,7 @@ class PIAA_ICI_CrossDomain(nn.Module):
 
         I_ij = torch.sum(fused_features_img, dim=1, keepdim=False) + torch.sum(fused_features_user, dim=1, keepdim=False)
         interaction_outputs = self.attr_corr(I_ij)
-        if self.use_da:
-            bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
-            direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
-        else:
-            direct_outputs = self.direct_fc(prob)
+        direct_outputs = self.direct_fc(prob)
         self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
         self._last_direct_mean = direct_outputs.detach().abs().mean().item()
         if return_feat:
@@ -300,13 +294,12 @@ class PIAA_ICI_CrossDomain(nn.Module):
 
 
 class PIAA_MIR_CrossDomain(nn.Module):
-    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=256, dropout=None, use_da=False):
+    def __init__(self, num_bins, num_attr, num_pt, genres, backbone_dict, input_dim=64, hidden_size=256, dropout=None):
         super(PIAA_MIR_CrossDomain, self).__init__()
         self.num_bins = num_bins
         self.num_attr = num_attr
         self.num_pt = num_pt
         self.genres = genres
-        self.use_da = use_da
 
         self.nima_dict = nn.ModuleDict()
         for genre in genres:
@@ -326,8 +319,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.interaction_mlp = MLP(
             interaction_input_dim, 512, input_dim, dropout=_dropout)
         self.attr_corr = nn.Linear(input_dim, 1)
-        if not use_da:
-            self.direct_fc = nn.Linear(num_bins, 1)
+        self.direct_fc = nn.Linear(num_bins, 1)
 
     def freeze_backbone(self):
         for genre, nima in self.nima_dict.items():
@@ -368,11 +360,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
 
         I_ij = self.interaction_mlp(A_flat)
         interaction_outputs = self.attr_corr(I_ij)
-        if self.use_da:
-            bins = torch.arange(1, self.num_bins + 1, dtype=prob.dtype, device=prob.device).unsqueeze(0)
-            direct_outputs = (prob * bins).sum(dim=1, keepdim=True)
-        else:
-            direct_outputs = self.direct_fc(prob)
+        direct_outputs = self.direct_fc(prob)
         self._last_interaction_mean = interaction_outputs.detach().abs().mean().item()
         self._last_direct_mean = direct_outputs.detach().abs().mean().item()
         if return_feat:
@@ -381,16 +369,14 @@ class PIAA_MIR_CrossDomain(nn.Module):
 
 
 def build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args):
-    method_name, _ = parse_da_method(getattr(args, 'da_method', None))
-    use_da = method_name is not None
     if args.model_type == 'MIR':
         return PIAA_MIR_CrossDomain(
             num_bins, num_attr, num_pt, genres, backbone_dict,
-            dropout=args.dropout, use_da=use_da)
+            dropout=args.dropout)
     else:
         return PIAA_ICI_CrossDomain(
             num_bins, num_attr, num_pt, genres, backbone_dict,
-            dropout=args.dropout, use_da=use_da)
+            dropout=args.dropout)
 
 
 def discover_folds(root_dir, version_prefix):
