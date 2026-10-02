@@ -579,6 +579,10 @@ class Image_GIAA_HistogramDataset(ImageDataset):
         return accumulated_histogram
 
     def __getitem__(self, idx):
+        # With cached features an item depends only on idx; GroupSplitData fills the memo up front.
+        memo = getattr(self, 'memo', None)
+        if memo is not None and idx in memo:
+            return memo[idx]
         item_data = copy.deepcopy(self.precomputed_data[idx])
         img_sample = super().__getitem__(self.image_to_indices_map[self.unique_images[idx]][0])
         inherit_list = ['image', 'sample_file']
@@ -587,6 +591,8 @@ class Image_GIAA_HistogramDataset(ImageDataset):
         item_data['traits'] = torch.tensor([i for i in range(10)])
         item_data['QIP'] = torch.tensor([i for i in range(10)])
 
+        if memo is not None:
+            memo[idx] = item_data
         return item_data
 
     def _save_map(self, file_path):
@@ -756,6 +762,7 @@ class GroupSplitData:
     GIAA: per-image score histograms from train users (train) or val users (val).
     PIAA pre: individual ratings of train users (train) or val users (val).
     PIAA fine: each user's 'train' / 'eval' samples listed in fine_samples.csv.
+    With args.feature_cache, every stage feeds cached frozen-backbone features (no augmentation).
     """
 
     def __init__(self, args, genre, split, global_trait_encoders=None, global_age_bins=None):
@@ -794,18 +801,23 @@ class GroupSplitData:
                 map_file=os.path.join(self.pkl_dir, f'giaa_{role}_map.pkl'),
                 precompute_file=os.path.join(self.pkl_dir, f'giaa_{role}_hist.pkl'),
                 max_frames=self.train_max_frames if is_train else None, is_train=is_train, **self.enc_kwargs)
+            self._fill_features(self._giaa[role])
         return self._giaa[role]
+
+    def _fill_features(self, dataset):
+        """Feed cached frozen-backbone features in place of images (no augmentation) and build every item once."""
+        if self.features is not None:
+            dataset.features = self.features
+            dataset.memo = {}
+            for i in range(len(dataset)):
+                dataset[i]
 
     def piaa(self, rows, is_train):
         dataset = Image_PIAA_HistogramDataset(
             self.args.root_dir, transform=self.train_transform if is_train else self.test_transform,
             data=rows.reset_index(drop=True), genre=self.genre, backbone=self.args.backbone,
             max_frames=self.train_max_frames if is_train else None, is_train=is_train, **self.enc_kwargs)
-        if self.features is not None:
-            dataset.features = self.features
-            dataset.memo = {}
-            for i in range(len(dataset)):
-                dataset[i]
+        self._fill_features(dataset)
         return dataset
 
     def pre(self, role):

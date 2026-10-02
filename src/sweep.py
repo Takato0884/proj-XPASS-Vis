@@ -84,7 +84,7 @@ def parse_cli():
                         help='Default: both, except train_domain only for SourceOnly (its test run is '
                              'then inference of the TargetOnly chain on the other domains; oracle retrains)')
     parser.add_argument('--no_feature_cache', action='store_true',
-                        help='Feed images to the frozen backbone in PIAA instead of cached features')
+                        help='Feed augmented images to the frozen backbone instead of cached features (all stages)')
     parser.add_argument('--stop_after', type=str, default=None, choices=['giaa', 'pre', 'fine'],
                         help='Run the chain only up to this stage (no test run or final record)')
     parser.add_argument('--split_dir', type=str, default='asset/split')
