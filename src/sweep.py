@@ -39,7 +39,7 @@ Checkpoints go under --models_dir.
 
 Usage:
     python -m src.sweep --fold 0 --method DANN --source art --target fashion --n_trials 20
-    python -m src.sweep --fold 0 --method SourceOnly --source art          # both targets, train_domain only
+    python -m src.sweep --fold 0 --method SourceOnly --source art          # both targets, both criteria
     python -m src.sweep --fold 0 --method TargetOnly --target fashion
     python -m src.sweep --fold 0 --method TargetOnly --target fashion --stop_after pre
 """
@@ -80,9 +80,7 @@ def parse_cli():
     parser.add_argument('--model_type', type=str, default='ICI', choices=['ICI', 'MIR'])
     parser.add_argument('--n_trials', type=int, default=20, help='Configurations per stage, common to all methods')
     parser.add_argument('--search_seed', type=int, default=0)
-    parser.add_argument('--criteria', type=str, nargs='+', default=None, choices=CRITERIA,
-                        help='Default: both, except train_domain only for SourceOnly (its test run is '
-                             'then inference of the TargetOnly chain on the other domains; oracle retrains)')
+    parser.add_argument('--criteria', type=str, nargs='+', default=CRITERIA, choices=CRITERIA)
     parser.add_argument('--no_feature_cache', action='store_true',
                         help='Feed augmented images to the frozen backbone instead of cached features (all stages)')
     parser.add_argument('--stop_after', type=str, default=None, choices=['giaa', 'pre', 'fine'],
@@ -103,8 +101,6 @@ def parse_cli():
         parser.error(f'--method {cli.method} requires --source')
     if cli.source is not None and cli.source == cli.target:
         parser.error('--source and --target must differ')
-    if cli.criteria is None:
-        cli.criteria = ['train_domain'] if cli.method == 'SourceOnly' else CRITERIA
     return cli
 
 
