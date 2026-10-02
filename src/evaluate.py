@@ -212,19 +212,35 @@ def evaluate_piaa(model, dataloaders_dict, device, epoch: int = None, phase_name
     return genre_metrics, total_mae_loss
 
 
-def evaluate_piaa_mse(model, dataloader, device, head):
-    """Per-sample mean of the PIAA training loss (MSE on normalized scores), predicting with `head`."""
+def evaluate_piaa_pre(model, dataloader, device, head):
+    """PIAA pre-stage validation, predicting with `head`.
+
+    Returns the per-sample mean of the training loss (MSE on normalized scores) and
+    the mean per-user SCC; an undefined SCC (constant prediction) counts as 0.
+    """
     model.eval()
     total, count = 0.0, 0
+    preds, targets, user_ids = [], [], []
     with torch.no_grad():
-        for sample in tqdm(dataloader, leave=False, desc=f"MSE [{head}]", ncols=120, ascii="-="):
+        for sample in tqdm(dataloader, leave=False, desc=f"MSE/SCC [{head}]", ncols=120, ascii="-="):
             images = sample['image'].to(device)
             target = sample['Aesthetic'].to(device).view(-1, 1)
             with autocast('cuda'):
                 outputs = model(images, sample['traits'].float().to(device), sample['QIP'].float().to(device), head)
-            total += F.mse_loss(outputs.view(-1, 1).float(), target, reduction='sum').item()
+            outputs = outputs.view(-1, 1).float()
+            total += F.mse_loss(outputs, target, reduction='sum').item()
             count += target.size(0)
-    return total / max(count, 1)
+            preds.append(outputs.view(-1).cpu().numpy())
+            targets.append(target.view(-1).cpu().numpy())
+            user_ids.extend(_collect_user_ids(sample['user_id']))
+    preds, targets, user_ids = np.concatenate(preds), np.concatenate(targets), np.array(user_ids)
+    sccs = []
+    for uid in np.unique(user_ids):
+        mask = user_ids == uid
+        if mask.sum() > 1:
+            scc, _ = spearmanr(preds[mask], targets[mask])
+            sccs.append(0.0 if np.isnan(scc) else float(scc))
+    return total / max(count, 1), float(np.mean(sccs)) if sccs else float('nan')
 
 
 def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):

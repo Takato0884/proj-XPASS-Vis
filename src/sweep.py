@@ -5,6 +5,7 @@ each starting from the configuration selected in the previous stage:
 
     giaa  NIMA on train users' score histograms   selected by EMD on val users' images
     pre   PIAA on train users' ratings            selected by MSE on val users' ratings
+                                                  (mean per-user SCC also recorded)
     fine  per-user fine-tuning of the val users   selected by mean per-user SCC on their eval samples
 
 and the test users are then fine-tuned with the selected configuration and
@@ -27,7 +28,8 @@ trained and selected on the target domain.
 
 Results are cached per trial, so an interrupted run resumes where it stopped and
 chains that share a stage (e.g. Source-Only for two targets) reuse its trials.
-Only the best checkpoint per domain of interest is kept.
+Only the best checkpoint per domain of interest is kept (in pre, both the
+best-MSE and the best-SCC ones).
 
 Outputs go under --out_dir (default output/r16):
     results/fold{k}/      per-trial JSON records and final/ (selected configs, test SCC and CCC)
@@ -60,7 +62,7 @@ from torch.utils.data import DataLoader
 
 from .argflags import parse_arguments
 from .data import GENRES, GroupSplitData, build_global_encoders, collate_fn, load_group_split
-from .evaluate import evaluate, evaluate_piaa, evaluate_piaa_mse
+from .evaluate import evaluate, evaluate_piaa, evaluate_piaa_pre
 from .search_space import sample_hparams
 from .train_common import NIMA, build_piaa_model, num_bins
 
@@ -223,8 +225,12 @@ class Sweep:
         method, src, tgt = key
         return list(GENRES) if method == 'SourceOnly' else [src, tgt]
 
-    def _prune(self, records, genres, minimize):
-        keep = {_best(records, 'val_loss', g, minimize)['ckpt'] for g in genres}
+    def _prune(self, records, genres, metrics):
+        """Delete checkpoints except the best per domain for each (metric, minimize) in `metrics`."""
+        keep = set()
+        for metric, minimize in metrics:
+            scored = [r for r in records if metric in r]
+            keep |= {_best(scored, metric, g, minimize)['ckpt'] for g in genres if scored}
         for r in records:
             if r['ckpt'] not in keep and os.path.exists(r['ckpt']):
                 os.remove(r['ckpt'])
@@ -244,7 +250,7 @@ class Sweep:
                 record = self._run_giaa(key, t)
                 _write_json(path, record)
             records.append(record)
-            self._prune(records, self.eval_genres(key), minimize=True)
+            self._prune(records, self.eval_genres(key), [('val_loss', True)])
         return records
 
     def _run_giaa(self, key, t):
@@ -287,7 +293,7 @@ class Sweep:
                 record = self._run_pre(key, giaa, t)
                 _write_json(path, record)
             records.append(record)
-            self._prune(records, self.eval_genres(key), minimize=True)
+            self._prune(records, self.eval_genres(key), [('val_loss', True), ('val_scc', False)])
         return records
 
     def _run_pre(self, key, giaa, t):
@@ -318,13 +324,15 @@ class Sweep:
 
         model = build_piaa_model(num_bins, num_attr, num_pt, [src], backbone_dict, args).to(self.device)
         model.load_state_dict(torch.load(ckpt))
-        val_loss = {g: evaluate_piaa_mse(model, self.loader(self.data(g).pre('val'), args.batch_size),
-                                         self.device, head=src)
-                    for g in self.eval_genres(key)}
+        val_loss, val_scc = {}, {}
+        for g in self.eval_genres(key):
+            val_loss[g], val_scc[g] = evaluate_piaa_pre(model, self.loader(self.data(g).pre('val'), args.batch_size),
+                                                        self.device, head=src)
         del model
         self._release()
         return {'stage': 'pre', 'key': _key_name(key), 'base': _trial_id(giaa), 'trial': t, 'seed': seed,
-                'hparams': hp, 'metric': 'MSE on val users ratings', 'val_loss': val_loss, 'ckpt': ckpt}
+                'hparams': hp, 'metric': 'MSE on val users ratings (val_loss); mean per-user SCC on them (val_scc)',
+                'val_loss': val_loss, 'val_scc': val_scc, 'ckpt': ckpt}
 
     # ---------- fine / test ----------
 
