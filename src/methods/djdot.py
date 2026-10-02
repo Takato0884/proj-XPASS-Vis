@@ -12,9 +12,8 @@ from tqdm import tqdm
 import copy
 from torch.utils.data import DataLoader
 
-from ..train_common import fixed_epochs, earth_mover_distance, build_piaa_model, num_bins
+from ..train_common import earth_mover_distance, build_piaa_model, num_bins
 from ..data import collate_fn
-from ..evaluate import evaluate, evaluate_piaa
 
 
 def setup(model, args, device):
@@ -109,16 +108,11 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
 
 def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname, components,
             tgt_val_loader=None, tgt_genre=None):
-    src_train_loader, val_loader, _ = src_dataloaders
-
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=args.lr_decay_factor, patience=args.lr_patience)
+    src_train_loader = src_dataloaders[0]
 
     alpha = getattr(args, 'djdot_alpha', 0.1)
     lambda_t = getattr(args, 'djdot_lambda_t', 0.1)
 
-    best_val_emd = float('inf')
-    patience     = 0
     global_step  = 0
     scaler       = GradScaler('cuda')
 
@@ -141,54 +135,10 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
                 f"{args.genre}/Train Label Loss":      metrics['label_loss'],
                 f"{args.genre}/Train L_s Ratio":       L_s_ratio,
                 f"{args.genre}/Train L_feat Ratio":    L_feat_ratio,
-            }, commit=False)
+            }, commit=True)
 
-        if fixed_epochs(args):
-            continue
-
-        val_emd, val_srocc, _, val_mse, _, _, val_ccc = evaluate(
-            model, val_loader, device, epoch=epoch, phase_name="Val")
-        if args.is_log:
-            wandb.log({
-                "epoch": epoch,
-                f"{args.genre}/Val EMD GIAA":   val_emd,
-                f"{args.genre}/Val SROCC GIAA": val_srocc,
-                f"{args.genre}/Val MSE GIAA":   val_mse,
-                f"{args.genre}/Val CCC GIAA":   val_ccc,
-            }, commit=tgt_val_loader is None)
-
-        if tgt_val_loader is not None:
-            tgt_val_emd, tgt_val_srocc, _, tgt_val_mse, _, _, tgt_val_ccc = evaluate(
-                model, tgt_val_loader, device, epoch=epoch, phase_name=f"Val [{tgt_genre}]")
-            if args.is_log:
-                wandb.log({
-                    "epoch": epoch,
-                    f"{tgt_genre}/Val EMD GIAA":   tgt_val_emd,
-                    f"{tgt_genre}/Val SROCC GIAA": tgt_val_srocc,
-                    f"{tgt_genre}/Val MSE GIAA":   tgt_val_mse,
-                    f"{tgt_genre}/Val CCC GIAA":   tgt_val_ccc,
-                }, commit=True)
-
-        prev_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_emd)
-        cur_lr = optimizer.param_groups[0]['lr']
-        if cur_lr < prev_lr:
-            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
-
-        if val_emd < best_val_emd:
-            best_val_emd = val_emd
-            patience = 0
-            os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
-            torch.save(model.state_dict(), best_modelname)
-        else:
-            patience += 1
-            if patience >= args.max_patience_epochs:
-                print(f"Early stopping at epoch {epoch}")
-                break
-
-    if fixed_epochs(args):
-        os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
-        torch.save(model.state_dict(), best_modelname)
+    os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
+    torch.save(model.state_dict(), best_modelname)
 
     model.load_state_dict(torch.load(best_modelname))
 
@@ -233,7 +183,7 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
 
             with torch.no_grad():
                 feat_dist_d = torch.cdist(I_ij_src.float(), I_ij_tgt.float(), p=2).pow(2)
-                label_cost_d = (score_src.float() - score_tgt.float().T).pow(2)
+                label_cost_d = (aesthetic_src.float() - score_tgt.float().T).pow(2)
                 C = (alpha * feat_dist_d + lambda_t * label_cost_d).cpu().numpy().astype(np.float64)
                 n_s, n_t = C.shape
                 a = np.ones(n_s, dtype=np.float64) / n_s
@@ -243,7 +193,7 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
                 ).to(dtype=I_ij_src.dtype, device=device)
 
             feat_dist = torch.cdist(I_ij_src, I_ij_tgt, p=2).pow(2)
-            label_cost = (score_src - score_tgt.T).pow(2)
+            label_cost = (aesthetic_src - score_tgt.T).pow(2)
 
             L_feat = (gamma * feat_dist).sum()
             L_label = (gamma * label_cost).sum()
@@ -278,16 +228,11 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     genres = list(datasets_dict.keys())
     genre = genres[0]
     genre_str = domain_tag if domain_tag else genre
-    tgt_genre_name = domain_tag.split('2')[1] if domain_tag and '2' in domain_tag else 'target'
 
     src_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
                             drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
     tgt_loader = DataLoader(tgt_train_dataset, batch_size=batch_size, shuffle=True,
                             drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
-                                          num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-    tgt_val_loaders_dict = {genre: DataLoader(tgt_val_dataset, batch_size=batch_size, shuffle=False,
-                                              num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
     model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
 
@@ -307,10 +252,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     print(f"[Freeze] {total_params - trainable_params:,} frozen / {trainable_params:,} trainable / {total_params:,} total")
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
-    best_val_ccc = -float('inf')
-    patience = 0
     global_step = 0
     _djdot_run = experiment_name.removeprefix('DJDOT_')
     best_model_path = os.path.join(dirname, f'{genre_str}_DJDOT_{args.model_type}_{_djdot_run}_pretrain.pth')
@@ -338,60 +280,12 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train Label Loss": L_label,
                 f"{genre}/Train L_y Ratio": L_y_ratio,
                 f"{genre}/Train L_feat Ratio": L_feat_ratio,
-            }, commit=False)
+            }, commit=True)
 
-        if fixed_epochs(args):
-            continue
-
-        genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
-        val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
-
-        tgt_genre_metrics, _ = evaluate_piaa(model, tgt_val_loaders_dict, device, epoch=epoch, phase_name="Val (tgt)")
-
-        if args.is_log:
-            log_dict = {"epoch": epoch}
-            if genre in genre_metrics:
-                log_dict[f"{genre}/Val MAE"] = genre_metrics[genre]['mae']
-                log_dict[f"{genre}/Val SROCC"] = genre_metrics[genre]['srocc']
-                log_dict[f"{genre}/Val NDCG@10"] = genre_metrics[genre]['ndcg@10']
-                log_dict[f"{genre}/Val CCC"] = genre_metrics[genre]['ccc']
-            if hasattr(model, '_eval_component_stats') and genre in model._eval_component_stats:
-                cs = model._eval_component_stats[genre]
-                log_dict[f"{genre}/Val interaction_mean"] = cs['interaction_mean']
-                log_dict[f"{genre}/Val direct_mean"] = cs['direct_mean']
-                log_dict[f"{genre}/Val interaction_ratio"] = cs['ratio']
-            if genre in tgt_genre_metrics:
-                tgt_m = tgt_genre_metrics[genre]
-                log_dict[f"{tgt_genre_name}/Val MAE"] = tgt_m['mae']
-                log_dict[f"{tgt_genre_name}/Val SROCC"] = tgt_m['srocc']
-                log_dict[f"{tgt_genre_name}/Val NDCG@10"] = tgt_m['ndcg@10']
-                log_dict[f"{tgt_genre_name}/Val CCC"] = tgt_m['ccc']
-            wandb.log(log_dict, commit=True)
-
-        prev_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_ccc)
-        cur_lr = optimizer.param_groups[0]['lr']
-        if cur_lr < prev_lr:
-            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
-
-        if val_ccc > best_val_ccc:
-            best_val_ccc = val_ccc
-            patience = 0
-            if args.no_save_model:
-                best_state_dict = copy.deepcopy(model.state_dict())
-            else:
-                torch.save(model.state_dict(), best_model_path)
-        else:
-            patience += 1
-            if patience >= args.max_patience_epochs:
-                print(f"DJDOT Pretrain: early stopping at epoch {epoch}")
-                break
-
-    if fixed_epochs(args):
-        if args.no_save_model:
-            best_state_dict = copy.deepcopy(model.state_dict())
-        else:
-            torch.save(model.state_dict(), best_model_path)
+    if args.no_save_model:
+        best_state_dict = copy.deepcopy(model.state_dict())
+    else:
+        torch.save(model.state_dict(), best_model_path)
 
     return best_model_path, best_state_dict
 
@@ -415,9 +309,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         user_train_src = copy.copy(datasets_dict[genre]['train'])
         user_train_src.data = datasets_dict[genre]['train'].data[
             datasets_dict[genre]['train'].data['user_id'] == uid].reset_index(drop=True)
-        user_val_src = copy.copy(datasets_dict[genre]['val'])
-        user_val_src.data = datasets_dict[genre]['val'].data[
-            datasets_dict[genre]['val'].data['user_id'] == uid].reset_index(drop=True)
 
         tgt_train_mask = tgt_train_piaa_dataset.data['user_id'] == uid
         if tgt_train_mask.sum() == 0:
@@ -428,31 +319,17 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         user_train_tgt = copy.copy(tgt_train_piaa_dataset)
         user_train_tgt.data = tgt_train_piaa_dataset.data[tgt_train_mask].reset_index(drop=True)
 
-        tgt_val_mask = tgt_val_piaa_dataset.data['user_id'] == uid
-        if tgt_val_mask.sum() == 0:
-            raise ValueError(
-                f"User {uid} not found in target genre '{djdot_target_genre}' val_piaa_dataset. "
-                f"All finetune users must exist in the target genre."
-            )
-        user_val_tgt = copy.copy(tgt_val_piaa_dataset)
-        user_val_tgt.data = tgt_val_piaa_dataset.data[tgt_val_mask].reset_index(drop=True)
-
         total_train_src = len(user_train_src)
         total_train_tgt = len(user_train_tgt)
-        total_val_src = len(user_val_src)
-        print(f"User {uid}: train src={total_train_src}, train tgt={total_train_tgt}, val src={total_val_src}")
-        if total_train_src < batch_size or total_train_tgt < batch_size or total_val_src == 0:
-            print(f"Skipping user {uid}: need >={batch_size} samples per domain (val>0)")
+        print(f"User {uid}: train src={total_train_src}, train tgt={total_train_tgt}")
+        if total_train_src < batch_size or total_train_tgt < batch_size:
+            print(f"Skipping user {uid}: need >={batch_size} samples per domain")
             continue
 
         src_loader = DataLoader(user_train_src, batch_size=batch_size, shuffle=True, drop_last=True,
                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
         tgt_loader = DataLoader(user_train_tgt, batch_size=batch_size, shuffle=True, drop_last=True,
                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-        val_src_loaders = {genre: DataLoader(user_val_src, batch_size=batch_size, shuffle=False,
-                                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-        val_tgt_loaders = {genre: DataLoader(user_val_tgt, batch_size=batch_size, shuffle=False,
-                                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
         model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
         pretrained_path = pretrained_model_dict[genre]
@@ -460,9 +337,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             raise FileNotFoundError(f"DJDOT pretrained model not found: {pretrained_path}")
         try:
             state = torch.load(pretrained_path)
-            incompatible = model_user.load_state_dict(state, strict=False)
-            if incompatible.unexpected_keys:
-                print(f"[load_state_dict] Ignored unexpected keys: {incompatible.unexpected_keys}")
+            model_user.load_state_dict(state)
             print(f"Loaded DJDOT pretrain weights from {pretrained_path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load model weights from {pretrained_path}: {e}")
@@ -475,18 +350,13 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             print(f"[Freeze] {frozen_params:,} frozen / {trainable_params:,} trainable / {total_params:,} total")
 
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model_user.parameters()), lr=args.lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
         alpha = getattr(args, 'djdot_alpha', 0.001)
         lambda_t = getattr(args, 'djdot_lambda_t', 0.0001)
 
-        best_val_ccc = -float('inf')
-        patience = 0
         global_step = 0
         best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{experiment_name}_finetune.pth')
         scaler = GradScaler('cuda')
-
-        torch.save(model_user.state_dict(), best_model_path)
 
         for epoch in range(args.num_epochs):
             L_y, L_feat, L_label, global_step = _train_one_epoch_piaa(
@@ -498,47 +368,14 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             align_total = alpha * L_feat + lambda_t * L_label
             L_feat_ratio = (alpha * L_feat) / align_total if align_total > 0 else 0.0
 
-            if fixed_epochs(args):
-                continue
-
-            genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
-            val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
-
-            tgt_genre_metrics, _ = evaluate_piaa(model_user, val_tgt_loaders, device, epoch=epoch, phase_name="Val (tgt)")
-
             if args.is_log:
-                log_dict = {"epoch": epoch}
-                log_dict[f"{genre}/Train Loss user_{uid}"] = L_y
-                log_dict[f"{genre}/Train Feature Loss user_{uid}"] = L_feat
-                log_dict[f"{genre}/Train Label Loss user_{uid}"] = L_label
-                log_dict[f"{genre}/Train L_y Ratio user_{uid}"] = L_y_ratio
-                log_dict[f"{genre}/Train L_feat Ratio user_{uid}"] = L_feat_ratio
-                if genre in genre_metrics:
-                    log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
-                    log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
-                    log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
-                if genre in tgt_genre_metrics:
-                    tgt_m = tgt_genre_metrics[genre]
-                    log_dict[f"{djdot_target_genre}/Val MAE user_{uid}"] = tgt_m['mae']
-                    log_dict[f"{djdot_target_genre}/Val SROCC user_{uid}"] = tgt_m['srocc']
-                    log_dict[f"{djdot_target_genre}/Val CCC user_{uid}"] = tgt_m['ccc']
-                wandb.log(log_dict, commit=True)
+                wandb.log({
+                    "epoch": epoch,
+                    f"{genre}/Train Loss user_{uid}": L_y,
+                    f"{genre}/Train Feature Loss user_{uid}": L_feat,
+                    f"{genre}/Train Label Loss user_{uid}": L_label,
+                    f"{genre}/Train L_y Ratio user_{uid}": L_y_ratio,
+                    f"{genre}/Train L_feat Ratio user_{uid}": L_feat_ratio,
+                }, commit=True)
 
-            prev_lr = optimizer.param_groups[0]['lr']
-            scheduler.step(val_ccc)
-            cur_lr = optimizer.param_groups[0]['lr']
-            if cur_lr < prev_lr:
-                tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (user {uid}, epoch {epoch}) <<<")
-
-            if val_ccc > best_val_ccc:
-                best_val_ccc = val_ccc
-                patience = 0
-                torch.save(model_user.state_dict(), best_model_path)
-            else:
-                patience += 1
-                if patience >= args.max_patience_epochs:
-                    print(f"User {uid}: early stopping at epoch {epoch}")
-                    break
-
-        if fixed_epochs(args):
-            torch.save(model_user.state_dict(), best_model_path)
+        torch.save(model_user.state_dict(), best_model_path)

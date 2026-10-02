@@ -19,18 +19,13 @@ def parse_arguments(parse=True):
     parser.add_argument('--no_log', action='store_false', dest='is_log', help='Disable logging')
     parser.add_argument('--wandb_project', type=str, default='XPASS', help='wandb project name')
 
-    parser.add_argument('--num_epochs', type=int, default=200)
+    parser.add_argument('--num_epochs', type=int, default=20,
+                        help='Every run trains for exactly this many epochs and keeps the final checkpoint')
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--max_patience_epochs', type=int, default=10)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--lr', type=float, default=1e-5)
-    parser.add_argument('--lr_decay_factor', type=float, default=0.5)
-    parser.add_argument('--lr_patience', type=int, default=5)
     parser.add_argument('--no_save_model', action='store_true', default=False,
-                        help='If set, keep best model in memory instead of saving to disk')
-    parser.add_argument('--fixed_epochs', action='store_true', default=False,
-                        help='Train for exactly --num_epochs and keep the final checkpoint '
-                             '(no per-epoch validation, LR plateau schedule or early stopping).')
+                        help='If set, keep the final model in memory instead of saving to disk')
 
     parser.add_argument('--giaa_mode', action='store_true', default=False,
                         help='Use GIAA-only split files (train/val/test_images_GIAA.txt). '

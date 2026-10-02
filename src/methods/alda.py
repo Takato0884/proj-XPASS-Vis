@@ -12,11 +12,10 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from ..train_common import (
-    fixed_epochs, earth_mover_distance, GradientReversalLayer, get_da_lambda,
-    build_piaa_model, num_bins, parse_da_method, da_weight)
+    earth_mover_distance, GradientReversalLayer, get_da_lambda,
+    build_piaa_model, num_bins, da_weight)
 from ..data import collate_fn
-from ..evaluate import evaluate, evaluate_piaa
-from .cdan import gaussian_soft_label
+from .cdan import gaussian_soft_label, _piaa_score_to_bin
 
 
 class ALDADiscriminator(nn.Module):
@@ -47,10 +46,6 @@ def _compute_corrected_label(xi: torch.Tensor, y_onehot: torch.Tensor, K: int = 
 
 def _opposite_distribution(y_onehot: torch.Tensor, K: int = num_bins) -> torch.Tensor:
     return (1.0 - y_onehot) / (K - 1)
-
-
-def _piaa_score_to_bin(score: torch.Tensor) -> torch.Tensor:
-    return score * (num_bins - 1) + 1.0
 
 
 def _piaa_score_to_class_idx(score: torch.Tensor) -> torch.Tensor:
@@ -198,7 +193,7 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
 
 def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname, components,
             tgt_val_loader=None, tgt_genre=None):
-    src_train_loader, val_loader, _ = src_dataloaders
+    src_train_loader = src_dataloaders[0]
     discriminator = components['discriminator']
     grl = components['grl']
     optimizer_disc = components['optimizer_disc']
@@ -206,14 +201,9 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
     if tgt_loader is None:
         raise ValueError("ALDA GIAA requires a target loader (use --da_method ALDA-<target>).")
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=args.lr_decay_factor, patience=args.lr_patience)
-
     steps_per_epoch = len(src_train_loader)
     alda_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
-    best_val_emd = float('inf')
-    patience = 0
     global_step = 0
     scaler = GradScaler('cuda')
 
@@ -246,54 +236,10 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
                 f"{args.genre}/Train Disc Acc (tgt)": metrics['disc_acc_tgt'],
                 f"{args.genre}/Train max(p_t)": metrics['max_pt'],
                 f"{args.genre}/ALDA lambda": lambda_,
-            }, commit=False)
+            }, commit=True)
 
-        if fixed_epochs(args):
-            continue
-
-        val_emd, val_srocc, _, val_mse, _, _, val_ccc = evaluate(
-            model, val_loader, device, epoch=epoch, phase_name="Val")
-        if args.is_log:
-            wandb.log({
-                "epoch": epoch,
-                f"{args.genre}/Val EMD GIAA": val_emd,
-                f"{args.genre}/Val SROCC GIAA": val_srocc,
-                f"{args.genre}/Val MSE GIAA": val_mse,
-                f"{args.genre}/Val CCC GIAA": val_ccc,
-            }, commit=tgt_val_loader is None)
-
-        if tgt_val_loader is not None:
-            tgt_val_emd, tgt_val_srocc, _, tgt_val_mse, _, _, tgt_val_ccc = evaluate(
-                model, tgt_val_loader, device, epoch=epoch, phase_name=f"Val [{tgt_genre}]")
-            if args.is_log:
-                wandb.log({
-                    "epoch": epoch,
-                    f"{tgt_genre}/Val EMD GIAA": tgt_val_emd,
-                    f"{tgt_genre}/Val SROCC GIAA": tgt_val_srocc,
-                    f"{tgt_genre}/Val MSE GIAA": tgt_val_mse,
-                    f"{tgt_genre}/Val CCC GIAA": tgt_val_ccc,
-                }, commit=True)
-
-        prev_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_emd)
-        cur_lr = optimizer.param_groups[0]['lr']
-        if cur_lr < prev_lr:
-            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
-
-        if val_emd < best_val_emd:
-            best_val_emd = val_emd
-            patience = 0
-            os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
-            torch.save(model.state_dict(), best_modelname)
-        else:
-            patience += 1
-            if patience >= args.max_patience_epochs:
-                print(f"ALDA: early stopping at epoch {epoch}")
-                break
-
-    if fixed_epochs(args):
-        os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
-        torch.save(model.state_dict(), best_modelname)
+    os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
+    torch.save(model.state_dict(), best_modelname)
 
     model.load_state_dict(torch.load(best_modelname))
 
@@ -429,24 +375,16 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, discriminator, grl,
 def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
                      experiment_name, backbone_dict, pretrained_model_dict, num_attr, num_pt,
                      domain_tag=None):
-    if getattr(args, 'model_type', 'ICI') != 'ICI':
-        raise NotImplementedError("ALDA pretrain supports the ICI model only")
-
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
     genre = genres[0]
     genre_str = domain_tag if domain_tag else genre
-    alda_target_genre = parse_da_method(getattr(args, 'da_method', None))[1]
     sigma = float(getattr(args, 'alda_sigma', 1.0))
 
     src_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
                             drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
     tgt_loader = DataLoader(tgt_train_dataset, batch_size=batch_size, shuffle=True,
                             drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
-                                          num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-    tgt_val_loaders_dict = {genre: DataLoader(tgt_val_dataset, batch_size=batch_size, shuffle=False,
-                                              num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
     model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
 
@@ -469,14 +407,11 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     discriminator = ALDADiscriminator(d_f, K=num_bins).to(device)
     grl = GradientReversalLayer()
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-    optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
+    optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
 
     steps_per_epoch = len(src_loader)
     alda_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
-    best_val_ccc = -float('inf')
-    patience = 0
     global_step = 0
     _alda_run = experiment_name.removeprefix('ALDA_')
     best_model_path = os.path.join(dirname, f'{genre_str}_ALDA_{args.model_type}_{_alda_run}_pretrain.pth')
@@ -509,61 +444,13 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train Disc Acc (tgt)": disc_acc_tgt,
                 f"{genre}/Train max(p_t)": max_pt,
                 f"{genre}/ALDA lambda": lambda_,
-            }, commit=False)
+            }, commit=True)
 
-        if fixed_epochs(args):
-            continue
-
-        genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
-        val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
-
-        tgt_genre_metrics, _ = evaluate_piaa(model, tgt_val_loaders_dict, device, epoch=epoch, phase_name="Val (tgt)")
-
-        if args.is_log:
-            log_dict = {"epoch": epoch}
-            if genre in genre_metrics:
-                log_dict[f"{genre}/Val MAE"] = genre_metrics[genre]['mae']
-                log_dict[f"{genre}/Val SROCC"] = genre_metrics[genre]['srocc']
-                log_dict[f"{genre}/Val NDCG@10"] = genre_metrics[genre]['ndcg@10']
-                log_dict[f"{genre}/Val CCC"] = genre_metrics[genre]['ccc']
-            if hasattr(model, '_eval_component_stats') and genre in model._eval_component_stats:
-                cs = model._eval_component_stats[genre]
-                log_dict[f"{genre}/Val interaction_mean"] = cs['interaction_mean']
-                log_dict[f"{genre}/Val direct_mean"] = cs['direct_mean']
-                log_dict[f"{genre}/Val interaction_ratio"] = cs['ratio']
-            if genre in tgt_genre_metrics:
-                tgt_m = tgt_genre_metrics[genre]
-                log_dict[f"{alda_target_genre}/Val MAE"] = tgt_m['mae']
-                log_dict[f"{alda_target_genre}/Val SROCC"] = tgt_m['srocc']
-                log_dict[f"{alda_target_genre}/Val NDCG@10"] = tgt_m['ndcg@10']
-                log_dict[f"{alda_target_genre}/Val CCC"] = tgt_m['ccc']
-            wandb.log(log_dict, commit=True)
-
-        prev_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_ccc)
-        cur_lr = optimizer.param_groups[0]['lr']
-        if cur_lr < prev_lr:
-            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
-
-        if val_ccc > best_val_ccc:
-            best_val_ccc = val_ccc
-            patience = 0
-            if args.no_save_model:
-                best_state_dict = copy.deepcopy(model.state_dict())
-            else:
-                os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
-                torch.save(model.state_dict(), best_model_path)
-        else:
-            patience += 1
-            if patience >= args.max_patience_epochs:
-                print(f"ALDA Pretrain: early stopping at epoch {epoch}")
-                break
-
-    if fixed_epochs(args):
-        if args.no_save_model:
-            best_state_dict = copy.deepcopy(model.state_dict())
-        else:
-            torch.save(model.state_dict(), best_model_path)
+    if args.no_save_model:
+        best_state_dict = copy.deepcopy(model.state_dict())
+    else:
+        os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
+        torch.save(model.state_dict(), best_model_path)
 
     return best_model_path, best_state_dict
 
@@ -571,9 +458,6 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
 def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                      args, device, dirname, experiment_name, backbone_dict,
                      pretrained_model_dict, num_attr, num_pt, alda_target_genre=None):
-    if getattr(args, 'model_type', 'ICI') != 'ICI':
-        raise NotImplementedError("ALDA finetune supports the ICI model only")
-
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
     genre = genres[0]
@@ -589,9 +473,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         user_train_src = copy.copy(datasets_dict[genre]['train'])
         user_train_src.data = datasets_dict[genre]['train'].data[
             datasets_dict[genre]['train'].data['user_id'] == uid].reset_index(drop=True)
-        user_val_src = copy.copy(datasets_dict[genre]['val'])
-        user_val_src.data = datasets_dict[genre]['val'].data[
-            datasets_dict[genre]['val'].data['user_id'] == uid].reset_index(drop=True)
 
         tgt_train_mask = tgt_train_piaa_dataset.data['user_id'] == uid
         if tgt_train_mask.sum() == 0:
@@ -602,20 +483,10 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         user_train_tgt = copy.copy(tgt_train_piaa_dataset)
         user_train_tgt.data = tgt_train_piaa_dataset.data[tgt_train_mask].reset_index(drop=True)
 
-        tgt_val_mask = tgt_val_piaa_dataset.data['user_id'] == uid
-        if tgt_val_mask.sum() == 0:
-            raise ValueError(
-                f"User {uid} not found in target genre '{alda_target_genre}' val_piaa_dataset. "
-                f"All finetune users must exist in the target genre."
-            )
-        user_val_tgt = copy.copy(tgt_val_piaa_dataset)
-        user_val_tgt.data = tgt_val_piaa_dataset.data[tgt_val_mask].reset_index(drop=True)
-
         total_train_src = len(user_train_src)
         total_train_tgt = len(user_train_tgt)
-        total_val_src = len(user_val_src)
-        print(f"User {uid}: train src={total_train_src}, train tgt={total_train_tgt}, val src={total_val_src}")
-        if total_train_src < batch_size or total_train_tgt < batch_size or total_val_src == 0:
+        print(f"User {uid}: train src={total_train_src}, train tgt={total_train_tgt}")
+        if total_train_src < batch_size or total_train_tgt < batch_size:
             print(f"Skipping user {uid}: need >={batch_size} per split")
             continue
 
@@ -623,10 +494,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
         tgt_loader = DataLoader(user_train_tgt, batch_size=batch_size, shuffle=True, drop_last=True,
                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-        val_src_loaders = {genre: DataLoader(user_val_src, batch_size=batch_size, shuffle=False,
-                                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-        val_tgt_loaders = {genre: DataLoader(user_val_tgt, batch_size=batch_size, shuffle=False,
-                                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
         model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
         pretrained_path = pretrained_model_dict[genre]
@@ -634,9 +501,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             raise FileNotFoundError(f"ALDA pretrained model not found: {pretrained_path}")
         try:
             state = torch.load(pretrained_path)
-            incompatible = model_user.load_state_dict(state, strict=False)
-            if incompatible.unexpected_keys:
-                print(f"[load_state_dict] Ignored unexpected keys: {incompatible.unexpected_keys}")
+            model_user.load_state_dict(state)
             print(f"Loaded ALDA pretrain weights from {pretrained_path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load model weights from {pretrained_path}: {e}")
@@ -652,19 +517,14 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         discriminator = ALDADiscriminator(d_f, K=num_bins).to(device)
         grl = GradientReversalLayer()
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model_user.parameters()), lr=args.lr)
-        optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
+        optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
 
         steps_per_epoch = len(src_loader)
         alda_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
-        best_val_ccc = -float('inf')
-        patience = 0
         global_step = 0
         best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{experiment_name}_finetune.pth')
         scaler = GradScaler('cuda')
-
-        torch.save(model_user.state_dict(), best_model_path)
 
         for epoch in range(args.num_epochs):
             L_y, L_T, L_Adv, L_Reg, disc_acc_tgt, max_pt, weighted_da, cls_total, disc_total, global_step = _train_one_epoch_piaa(
@@ -677,53 +537,20 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             ratio_Ly_cls = L_y / cls_total if cls_total > 0 else 0.0
             ratio_Adv_disc = (da_weight(args, 0.05) * L_Adv) / disc_total if disc_total > 0 else 0.0
 
-            if fixed_epochs(args):
-                continue
-
-            genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
-            val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
-
-            tgt_genre_metrics, _ = evaluate_piaa(model_user, val_tgt_loaders, device, epoch=epoch, phase_name="Val (tgt)")
-
             if args.is_log:
-                log_dict = {"epoch": epoch}
-                log_dict[f"{genre}/Train Loss user_{uid}"] = L_y
-                log_dict[f"{genre}/Train L_T user_{uid}"] = L_T
-                log_dict[f"{genre}/Train L_Adv user_{uid}"] = L_Adv
-                log_dict[f"{genre}/Train L_Reg user_{uid}"] = L_Reg
-                log_dict[f"{genre}/Train DA total (weighted) user_{uid}"] = weighted_da
-                log_dict[f"{genre}/Train ratio L_y/(L_y+DA) user_{uid}"] = ratio_Ly
-                log_dict[f"{genre}/Train ratio L_y in classifier user_{uid}"] = ratio_Ly_cls
-                log_dict[f"{genre}/Train ratio L_Adv in discriminator user_{uid}"] = ratio_Adv_disc
-                log_dict[f"{genre}/Train Disc Acc (tgt) user_{uid}"] = disc_acc_tgt
-                log_dict[f"{genre}/Train max(p_t) user_{uid}"] = max_pt
-                log_dict[f"{genre}/ALDA lambda user_{uid}"] = lambda_
-                if genre in genre_metrics:
-                    log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
-                    log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
-                    log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
-                if genre in tgt_genre_metrics:
-                    tgt_m = tgt_genre_metrics[genre]
-                    log_dict[f"{alda_target_genre}/Val MAE user_{uid}"] = tgt_m['mae']
-                    log_dict[f"{alda_target_genre}/Val SROCC user_{uid}"] = tgt_m['srocc']
-                    log_dict[f"{alda_target_genre}/Val CCC user_{uid}"] = tgt_m['ccc']
-                wandb.log(log_dict, commit=True)
+                wandb.log({
+                    "epoch": epoch,
+                    f"{genre}/Train Loss user_{uid}": L_y,
+                    f"{genre}/Train L_T user_{uid}": L_T,
+                    f"{genre}/Train L_Adv user_{uid}": L_Adv,
+                    f"{genre}/Train L_Reg user_{uid}": L_Reg,
+                    f"{genre}/Train DA total (weighted) user_{uid}": weighted_da,
+                    f"{genre}/Train ratio L_y/(L_y+DA) user_{uid}": ratio_Ly,
+                    f"{genre}/Train ratio L_y in classifier user_{uid}": ratio_Ly_cls,
+                    f"{genre}/Train ratio L_Adv in discriminator user_{uid}": ratio_Adv_disc,
+                    f"{genre}/Train Disc Acc (tgt) user_{uid}": disc_acc_tgt,
+                    f"{genre}/Train max(p_t) user_{uid}": max_pt,
+                    f"{genre}/ALDA lambda user_{uid}": lambda_,
+                }, commit=True)
 
-            prev_lr = optimizer.param_groups[0]['lr']
-            scheduler.step(val_ccc)
-            cur_lr = optimizer.param_groups[0]['lr']
-            if cur_lr < prev_lr:
-                tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (user {uid}, epoch {epoch}) <<<")
-
-            if val_ccc > best_val_ccc:
-                best_val_ccc = val_ccc
-                patience = 0
-                torch.save(model_user.state_dict(), best_model_path)
-            else:
-                patience += 1
-                if patience >= args.max_patience_epochs:
-                    print(f"User {uid}: early stopping at epoch {epoch}")
-                    break
-
-        if fixed_epochs(args):
-            torch.save(model_user.state_dict(), best_model_path)
+        torch.save(model_user.state_dict(), best_model_path)

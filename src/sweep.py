@@ -45,7 +45,6 @@ Usage:
 """
 import argparse
 import copy
-import hashlib
 import importlib
 import json
 import math
@@ -69,6 +68,7 @@ from .train_common import NIMA, build_piaa_model, num_bins
 DA_METHODS = ['DANN', 'DJDOT', 'JUMBOT', 'DEEPCORAL', 'CDAN', 'ALDA', 'DAREGRAM', 'RSD']
 NO_GIAA = {'DAREGRAM', 'RSD'}
 CRITERIA = ['train_domain', 'oracle']
+SEED = 42  # every training run (each trial, and each user's fine-tuning) starts from this seed
 
 
 def parse_cli():
@@ -102,10 +102,6 @@ def parse_cli():
     if cli.source is not None and cli.source == cli.target:
         parser.error('--source and --target must differ')
     return cli
-
-
-def _stable_seed(*parts):
-    return int(hashlib.md5('|'.join(map(str, parts)).encode()).hexdigest(), 16) % (2 ** 31)
 
 
 def _seed_everything(seed):
@@ -209,7 +205,6 @@ class Sweep:
         args.model_type = self.cli.model_type
         args.dataset_ver = f'group_fold{self.cli.fold}'
         args.is_log = False
-        args.fixed_epochs = True
         args.feature_cache = not self.cli.no_feature_cache
         args.no_save_model = False
         args.da_method = f'{method}-{target}' if method in DA_METHODS else None
@@ -253,8 +248,7 @@ class Sweep:
         method, src, tgt = key
         hp = sample_hparams(method, 'giaa', t, self.cli.search_seed)
         args = self.args(src, method, tgt, hp)
-        seed = _stable_seed(self.cli.fold, 'giaa', _key_name(key), t)
-        _seed_everything(seed)
+        _seed_everything(SEED)
         print(f'\n[giaa] {_key_name(key)} trial {t}: {hp}')
 
         mod = _method_module(method)
@@ -274,7 +268,7 @@ class Sweep:
             val_loss[g] = float(evaluate(model, val_loader, self.device, phase_name=f'Val EMD [{g}]')[0])
         del model, optimizer, components
         self._release()
-        return {'stage': 'giaa', 'key': _key_name(key), 'trial': t, 'seed': seed, 'hparams': hp,
+        return {'stage': 'giaa', 'key': _key_name(key), 'trial': t, 'seed': SEED, 'hparams': hp,
                 'metric': 'EMD on val users images', 'val_loss': val_loss, 'ckpt': ckpt}
 
     # ---------- pre ----------
@@ -296,8 +290,7 @@ class Sweep:
         method, src, tgt = key
         hp = sample_hparams(method, 'pre', t, self.cli.search_seed)
         args = self.args(src, method, tgt, hp)
-        seed = _stable_seed(self.cli.fold, self.cli.model_type, 'pre', _key_name(key), _trial_id(giaa), t)
-        _seed_everything(seed)
+        _seed_everything(SEED)
         print(f'\n[pre] {_key_name(key)} on {_trial_id(giaa)} trial {t}: {hp}')
 
         num_attr, num_pt = self.dims(src)
@@ -326,7 +319,7 @@ class Sweep:
                                                         self.device, head=src)
         del model
         self._release()
-        return {'stage': 'pre', 'key': _key_name(key), 'base': _trial_id(giaa), 'trial': t, 'seed': seed,
+        return {'stage': 'pre', 'key': _key_name(key), 'base': _trial_id(giaa), 'trial': t, 'seed': SEED,
                 'hparams': hp, 'metric': 'MSE on val users ratings (val_loss); mean per-user SCC on them (val_scc)',
                 'val_loss': val_loss, 'val_scc': val_scc, 'ckpt': ckpt}
 
@@ -342,9 +335,8 @@ class Sweep:
                 method = key[0]
                 hp = sample_hparams(method, 'fine', t, self.cli.search_seed)
                 print(f'\n[fine] {_key_name(key)} on {_pre_id(pre)} trial {t}: {hp}')
-                seed = _stable_seed(self.cli.fold, self.cli.model_type, 'fine', _key_name(key), _pre_id(pre), t)
-                result = self._fine_users(key, pre, hp, self.split['val_users'], seed)
-                record = {'stage': 'fine', 'key': _key_name(key), 'base': _pre_id(pre), 'trial': t, 'seed': seed,
+                result = self._fine_users(key, pre, hp, self.split['val_users'], f'fine-t{t:03d}')
+                record = {'stage': 'fine', 'key': _key_name(key), 'base': _pre_id(pre), 'trial': t, 'seed': SEED,
                           'hparams': hp, 'metric': 'mean per-user SCC on val users eval samples',
                           'val_scc': result['scc'], 'val_ccc': result['ccc'], 'per_user': result['per_user'],
                           'per_user_ccc': result['per_user_ccc']}
@@ -360,7 +352,7 @@ class Sweep:
             print(f"\n[test] {_key_name(key)} on {_pre_id(pre)} fine trial {fine['trial']}")
             pred_path = os.path.join(self.pred_dir, self.cli.model_type, _key_name(key), _pre_id(pre),
                                      f"fine-t{fine['trial']:03d}.csv")
-            result = self._fine_users(key, pre, fine['hparams'], self.split['test_users'], fine['seed'],
+            result = self._fine_users(key, pre, fine['hparams'], self.split['test_users'], f"test-t{fine['trial']:03d}",
                                       pred_path=pred_path)
             record = {'stage': 'test', 'key': _key_name(key), 'base': _pre_id(pre), 'fine_trial': fine['trial'],
                       'hparams': fine['hparams'], 'metric': 'mean per-user SCC and CCC on test users eval samples',
@@ -369,7 +361,7 @@ class Sweep:
             _write_json(path, record)
         return record
 
-    def _fine_users(self, key, pre, hp, users, seed, pred_path=None):
+    def _fine_users(self, key, pre, hp, users, run_name, pred_path=None):
         """Fine-tune each user on their source 'train' samples; SCC and CCC on their 'eval' samples per domain.
 
         With `pred_path`, the per-sample predictions are also written there as CSV.
@@ -378,7 +370,8 @@ class Sweep:
         args = self.args(src, method, tgt, hp)
         num_attr, num_pt = self.dims(src)
         backbone_dict = {src: args.backbone}
-        tmp_dir = os.path.join(self.model_dir, self.cli.model_type, 'tmp_fine')
+        # Per-run directory, so concurrent runs sharing a fold and source do not overwrite each other.
+        tmp_dir = os.path.join(self.model_dir, self.cli.model_type, 'tmp_fine', f'{_key_name(key)}-{_pre_id(pre)}-{run_name}')
         os.makedirs(tmp_dir, exist_ok=True)
         mod = _method_module(method)
         train_all = self.fine_set(src, users, 'train')
@@ -388,7 +381,7 @@ class Sweep:
         per_user_ccc = {}
         predictions = []
         for uid in users:
-            _seed_everything(_stable_seed(seed, uid))
+            _seed_everything(SEED)
             train = _subset(train_all, uid)
             datasets_dict = {src: {'train': train, 'val': train, 'test': None}}
             exp = f'u{uid}'
@@ -420,6 +413,8 @@ class Sweep:
                     predictions.append(rows)
             del model
             self._release()
+
+        os.rmdir(tmp_dir)
 
         if pred_path:
             os.makedirs(os.path.dirname(pred_path), exist_ok=True)

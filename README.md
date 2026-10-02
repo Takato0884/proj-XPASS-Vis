@@ -90,12 +90,9 @@ data/
 | `--backbone` | str | `clip_vit_b16` | Backbone architecture (`resnet50` / `i3d` / `vit_b_16` / `clip_rn50` / `clip_vit_b16`) |
 | `--use_video` | flag | `False` | Use video data for the scenery genre. Only when combined with `--backbone resnet50` does it automatically switch to the I3D backbone. If not specified, image data is used (the backbone follows the `--backbone` setting) |
 | `--root_dir` | str | `data` | Root directory of image/video data |
-| `--num_epochs` | int | `200` | Maximum number of epochs |
+| `--num_epochs` | int | `20` | Number of epochs (fixed; no early stopping or LR schedule, the final checkpoint is kept) |
 | `--batch_size` | int | `32` | Batch size |
 | `--lr` | float | `1e-5` | Learning rate |
-| `--lr_decay_factor` | float | `0.5` | ReduceLROnPlateau decay rate (factor) |
-| `--lr_patience` | int | `5` | ReduceLROnPlateau patience (number of epochs tolerated without improvement) |
-| `--max_patience_epochs` | int | `10` | Early stopping patience epochs |
 | `--dropout` | float | `0.1` | Dropout rate (applied to the intermediate layers of `fc_aesthetic`) |
 | `--num_workers` | int | `4` | Number of DataLoader workers |
 | `--no_log` | flag | `False` | Disable wandb logging |
@@ -150,8 +147,8 @@ In GIAA training (`train_GIAA`), domain adaptation can be enabled by specifying 
 | **DeepCORAL** | `DEEPCORAL-fashion` | Aligns distributions by minimizing the difference in second-order statistics (covariance matrices) of source and target features | GIAA / PIAA |
 | **CDAN** | `CDAN-fashion` | Adversarial training with a domain discriminator conditioned on the multilinear combination of features and class predictions | GIAA / PIAA |
 | **ALDA** | `ALDA-fashion` | Adversarial-Learned Loss that corrects the target pseudo-label loss (L_T) using a confusion matrix learned via adversarial training | GIAA / PIAA |
-| **DARE-GRAM** | `DAREGRAM-fashion` | Aligns the source and target feature spaces at the geometric-structure level of linear regression by matching the angle (cosine similarity) and scale (singular values) of Gram matrices | PIAA (ICI only) |
-| **RSD** | `RSD-fashion` | Regression-oriented Representation Subspace Distance that aligns the principal angles of the source and target feature subspaces | PIAA (ICI only) |
+| **DARE-GRAM** | `DAREGRAM-fashion` | Aligns the source and target feature spaces at the geometric-structure level of linear regression by matching the angle (cosine similarity) and scale (singular values) of Gram matrices | PIAA |
+| **RSD** | `RSD-fashion` | Regression-oriented Representation Subspace Distance that aligns the principal angles of the source and target feature subspaces | PIAA |
 
 For the formulation and theory of each method, please refer to the paper and the original publications. Below are practical usage notes specific to this repository.
 
@@ -159,7 +156,7 @@ For the formulation and theory of each method, please refer to the paper and the
 
 - **Specifying a method**: Pass `--da_method METHOD-target` (e.g., `DJDOT-fashion`). The relevant hyperparameters are listed in the argument tables above (per `[METHOD]` tag).
 - **Save path**: Models trained with domain adaptation are saved to `models_pth/{dataset_ver}/{source}2{target}/` (e.g., `models_pth/v_giaa/art2fashion/`).
-- **DARE-GRAM / RSD (ICI only)**: These have no GIAA mode, so the NIMA backbone used in PIAA pretrain is borrowed from another method via `--nima_da_method` (`source_only` loads from `models_pth/{ver}/{genre}/`; `DANN`, etc. load from `models_pth/{ver}/{src2tgt}/`).
+- **DARE-GRAM / RSD**: These have no GIAA mode, so the NIMA backbone used in PIAA pretrain is borrowed from another method via `--nima_da_method` (`source_only` loads from `models_pth/{ver}/{genre}/`; `DANN`, etc. load from `models_pth/{ver}/{src2tgt}/`).
 
 ### Examples
 
@@ -173,7 +170,7 @@ python -m src.train_GIAA --genre art --da_method JUMBOT-fashion \
   --dataset_ver v_giaa --jumbot_eta1 0.1 --jumbot_eta2 0.1 \
   --jumbot_eta3 1.0 --jumbot_tau 0.5 --jumbot_epsilon 0.1
 
-# DARE-GRAM: art → fashion (PIAA, ICI only)
+# DARE-GRAM: art → fashion (PIAA)
 python -m src.train_PIAA --genre art --dataset_ver v2_all \
   --piaa_mode PIAA_pretrain --da_method DAREGRAM-fashion \
   --nima_da_method source_only \
@@ -198,18 +195,15 @@ python -m src.train_PIAA --genre art --dataset_ver v2_all \
 | `--backbone` | str | `clip_vit_b16` | Backbone architecture (`resnet50` / `i3d` / `vit_b_16` / `clip_rn50` / `clip_vit_b16`) |
 | `--use_video` | flag | `False` | Use video data for the scenery genre. Only when combined with `--backbone resnet50` does it automatically switch to the I3D backbone. If not specified, image data is used (the backbone follows the `--backbone` setting) |
 | `--root_dir` | str | `data` | Root directory of image/video data |
-| `--num_epochs` | int | `200` | Maximum number of epochs |
+| `--num_epochs` | int | `20` | Number of epochs (fixed; no early stopping or LR schedule, the final checkpoint is kept) |
 | `--batch_size` | int | `32` (pretrain) / `8` (finetune) | Batch size (auto-set according to `--piaa_mode` when `--batch_size` is unspecified) |
 | `--lr` | float | `5e-6` (pretrain) / `1e-6` (finetune) | Learning rate (auto-set according to `--piaa_mode` when `--lr` is unspecified) |
-| `--lr_decay_factor` | float | `0.5` | ReduceLROnPlateau decay rate (factor) |
-| `--lr_patience` | int | `5` | ReduceLROnPlateau patience (number of epochs tolerated without improvement) |
-| `--max_patience_epochs` | int | `10` | Early stopping patience epochs |
 | `--dropout` | float | `0.1` | Dropout rate (applied to the intermediate layers of all MLPs) |
 | `--num_workers` | int | `4` | Number of DataLoader workers |
 | `--start_fold` | int | `1` | Fold number to resume from (1-indexed). Used when `--dataset_ver` ends with `_all` |
 | `--no_log` | flag | `False` | Disable wandb logging |
 | `--wandb_project` | str | `XPASS` | wandb project name |
-| `--no_save_model` | flag | `False` | Do not save the model to disk; keep the best model in memory |
+| `--no_save_model` | flag | `False` | Do not save the model to disk; keep the final model in memory |
 | `--da_method` | str | `None` | Specify a domain adaptation method and target domain. Format: `METHOD-target` (e.g., `DANN-fashion`, `DJDOT-scenery`). Omitting it means no domain adaptation |
 | `--eval_target` | str | `None` | Evaluate the target genre during source-only training (e.g., `fashion`). Records the target val EMD without domain adaptation |
 | `--da_schedule_epochs` | int | `50` | `[DANN]` λ schedule: number of epochs until λ reaches ~1.0. Internally converted to `total_steps = da_schedule_epochs × (data_size / batch_size)` |
@@ -278,10 +272,12 @@ The stages run in order. Each stage starts from the configuration selected in th
 The test users are then fine-tuned with the selected configuration and scored on their target-domain eval samples.
 
 Two selection criteria are used (DomainBed):
-- `train_domain`: selects on the val users' source domain. This criterion gives the main results.
-- `oracle`: selects on the val users' target domain. This criterion is for reference only.
+- `oracle` (test-domain validation): selects on the val users' target domain. This criterion gives the main results.
+- `train_domain` (training-domain validation): selects on the val users' source domain. These results are reported in the appendix.
 
-Every trial trains for a fixed 20 epochs in every stage and is scored once, at its final checkpoint. There is no early stopping, and no validation during training. Unlabeled target data comes from the train groups only. At the fine stage, the train-group target images are paired with the fine-tuned user's own traits. Search ranges, epochs and the per-stage batch sizes are defined in `src/search_space.py`. Each stage runs 20 trials. Trial 0 uses the values adopted by the original papers. Hyperparameters that are not searched are fixed to the original papers' values.
+Every method, including Source-Only, is run under both criteria.
+
+Every trial trains for a fixed 20 epochs in every stage and is scored once, at its final checkpoint. There is no early stopping, no learning-rate schedule, and no validation during training. Every training run starts from seed 42. All stages feed cached frozen CLIP features without augmentation. Unlabeled target data comes from the train groups only. At the fine stage, the train-group target images are paired with the fine-tuned user's own traits. Search ranges, epochs and the per-stage batch sizes are defined in `src/search_space.py`. Each stage runs 20 trials. Trial 0 uses the values adopted by the original papers. Hyperparameters that are not searched are fixed to the original papers' values.
 
 ### Example commands
 
@@ -303,7 +299,7 @@ python -m src.sweep --fold 0 --method TargetOnly --target fashion --n_trials 20
   | `logs/fold{k}/` | the console output of each command; progress bars are left out |
 
 - **Resuming and caching:** results are cached per trial. Rerunning a command resumes where it stopped. Runs that share a stage reuse its trials; for example, DARE-GRAM and RSD reuse Source-Only's GIAA stage.
-- **Checkpoints:** only the best checkpoint per domain is kept under `--models_dir` (default `models_pth/r16`).
+- **Checkpoints:** only the best checkpoint per domain is kept (in the pre stage, both the best-MSE and the best-SCC ones) under `--models_dir` (default `models_pth/r16`).
 - **Data location:** `--root_dir` (default `data`) must contain `samples/`.
 - **Feature cache:** the backbone is frozen in PIAA, so the PIAA stages feed cached CLIP features instead of images. The features are computed once per domain with the test transform (no augmentation) and saved to `<root_dir>/cash/features/`. Pass `--no_feature_cache` to feed images instead.
 - **Partial runs:** `--stop_after {giaa,pre,fine}` stops the chain after that stage, without the test run or the final record. For example, `python -m src.sweep --fold 0 --method TargetOnly --target art --model_type ICI --stop_after pre`.

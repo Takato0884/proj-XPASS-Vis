@@ -12,10 +12,9 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from ..train_common import (
-    fixed_epochs, earth_mover_distance, GradientReversalLayer, DomainDiscriminator, get_da_lambda,
-    build_piaa_model, num_bins, parse_da_method, da_weight)
+    earth_mover_distance, GradientReversalLayer, DomainDiscriminator, get_da_lambda,
+    build_piaa_model, num_bins, da_weight)
 from ..data import collate_fn
-from ..evaluate import evaluate, evaluate_piaa
 
 
 class MultilinearMap(nn.Module):
@@ -33,6 +32,11 @@ def gaussian_soft_label(y_hat: torch.Tensor, sigma: float, n_bins: int = num_bin
     c = torch.arange(1, n_bins + 1, device=y_hat.device, dtype=y_hat.dtype)
     logits = -(c - y_hat.view(-1, 1)) ** 2 / (2.0 * sigma * sigma)
     return torch.softmax(logits, dim=-1)
+
+
+def _piaa_score_to_bin(score: torch.Tensor) -> torch.Tensor:
+    """Map a PIAA score on the [0, 1] label scale to the 1..num_bins bin scale."""
+    return score * (num_bins - 1) + 1.0
 
 
 def setup(model, args, device):
@@ -87,7 +91,8 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
             prob_tgt = F.softmax(logit_tgt, dim=1)
 
             feat_all = torch.cat([domain_feat_src, domain_feat_tgt], dim=0)
-            prob_all = torch.cat([prob_src, prob_tgt], dim=0)
+            # g is detached, as in the official CDAN code: no adversarial gradient through the prediction.
+            prob_all = torch.cat([prob_src, prob_tgt], dim=0).detach()
             h_all = multilinear(feat_all, prob_all)
 
             domain_labels = torch.cat([
@@ -134,7 +139,7 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
 
 def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_modelname, components,
             tgt_val_loader=None, tgt_genre=None):
-    src_train_loader, val_loader, _ = src_dataloaders
+    src_train_loader, _, _ = src_dataloaders
     multilinear = components['multilinear']
     discriminator = components['discriminator']
     grl = components['grl']
@@ -143,14 +148,9 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
     if tgt_loader is None:
         raise ValueError("CDAN GIAA requires a target loader (use --da_method CDAN-<target>).")
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=args.lr_decay_factor, patience=args.lr_patience)
-
     steps_per_epoch = len(src_train_loader)
     cdan_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
-    best_val_emd = float('inf')
-    patience = 0
     global_step = 0
     scaler = GradScaler('cuda')
 
@@ -171,54 +171,10 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
                 f"{args.genre}/Train Domain Loss (tgt)": metrics['domain_loss_tgt'],
                 f"{args.genre}/Train Disc Acc (tgt)": metrics['disc_acc_tgt'],
                 f"{args.genre}/CDAN lambda": lambda_,
-            }, commit=False)
+            }, commit=True)
 
-        if fixed_epochs(args):
-            continue
-
-        val_emd, val_srocc, _, val_mse, _, _, val_ccc = evaluate(
-            model, val_loader, device, epoch=epoch, phase_name="Val")
-        if args.is_log:
-            wandb.log({
-                "epoch": epoch,
-                f"{args.genre}/Val EMD GIAA": val_emd,
-                f"{args.genre}/Val SROCC GIAA": val_srocc,
-                f"{args.genre}/Val MSE GIAA": val_mse,
-                f"{args.genre}/Val CCC GIAA": val_ccc,
-            }, commit=tgt_val_loader is None)
-
-        if tgt_val_loader is not None:
-            tgt_val_emd, tgt_val_srocc, _, tgt_val_mse, _, _, tgt_val_ccc = evaluate(
-                model, tgt_val_loader, device, epoch=epoch, phase_name=f"Val [{tgt_genre}]")
-            if args.is_log:
-                wandb.log({
-                    "epoch": epoch,
-                    f"{tgt_genre}/Val EMD GIAA": tgt_val_emd,
-                    f"{tgt_genre}/Val SROCC GIAA": tgt_val_srocc,
-                    f"{tgt_genre}/Val MSE GIAA": tgt_val_mse,
-                    f"{tgt_genre}/Val CCC GIAA": tgt_val_ccc,
-                }, commit=True)
-
-        prev_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_emd)
-        cur_lr = optimizer.param_groups[0]['lr']
-        if cur_lr < prev_lr:
-            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
-
-        if val_emd < best_val_emd:
-            best_val_emd = val_emd
-            patience = 0
-            os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
-            torch.save(model.state_dict(), best_modelname)
-        else:
-            patience += 1
-            if patience >= args.max_patience_epochs:
-                print(f"CDAN: early stopping at epoch {epoch}")
-                break
-
-    if fixed_epochs(args):
-        os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
-        torch.save(model.state_dict(), best_modelname)
+    os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
+    torch.save(model.state_dict(), best_modelname)
 
     model.load_state_dict(torch.load(best_modelname))
 
@@ -264,8 +220,9 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, multilinear, discrimina
 
             score_tgt, I_ij_tgt = model(images_tgt, pt_tgt, attr_tgt, genre, return_feat=True)
 
-            g_src = gaussian_soft_label(score_src.view(-1), sigma)
-            g_tgt = gaussian_soft_label(score_tgt.view(-1), sigma)
+            # g: soft label of the predicted score on the bin scale, detached as in the official CDAN code.
+            g_src = gaussian_soft_label(_piaa_score_to_bin(score_src.detach().view(-1)), sigma)
+            g_tgt = gaussian_soft_label(_piaa_score_to_bin(score_tgt.detach().view(-1)), sigma)
 
             feat_all = torch.cat([I_ij_src, I_ij_tgt], dim=0)
             g_all = torch.cat([g_src, g_tgt], dim=0)
@@ -310,24 +267,16 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, multilinear, discrimina
 def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, device, dirname,
                      experiment_name, backbone_dict, pretrained_model_dict, num_attr, num_pt,
                      domain_tag=None):
-    if getattr(args, 'model_type', 'ICI') != 'ICI':
-        raise NotImplementedError("CDAN pretrain supports the ICI model only")
-
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
     genre = genres[0]
     genre_str = domain_tag if domain_tag else genre
-    cdan_target_genre = parse_da_method(getattr(args, 'da_method', None))[1]
     sigma = float(getattr(args, 'cdan_sigma', 1.0))
 
     src_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
                             drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
     tgt_loader = DataLoader(tgt_train_dataset, batch_size=batch_size, shuffle=True,
                             drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-    val_loaders_dict = {genre: DataLoader(datasets_dict[genre]['val'], batch_size=batch_size, shuffle=False,
-                                          num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-    tgt_val_loaders_dict = {genre: DataLoader(tgt_val_dataset, batch_size=batch_size, shuffle=False,
-                                              num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
     model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
 
@@ -352,13 +301,10 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     grl = GradientReversalLayer()
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
     steps_per_epoch = len(src_loader)
     cdan_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
-    best_val_ccc = -float('inf')
-    patience = 0
     global_step = 0
     _cdan_run = experiment_name.removeprefix('CDAN_')
     best_model_path = os.path.join(dirname, f'{genre_str}_CDAN_{args.model_type}_{_cdan_run}_pretrain.pth')
@@ -382,61 +328,12 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
                 f"{genre}/Train Domain Loss (tgt)": L_d_tgt,
                 f"{genre}/Train Disc Acc (tgt)": disc_acc_tgt,
                 f"{genre}/CDAN lambda": lambda_,
-            }, commit=False)
+            }, commit=True)
 
-        if fixed_epochs(args):
-            continue
-
-        genre_metrics, _ = evaluate_piaa(model, val_loaders_dict, device, epoch=epoch, phase_name="Val")
-        val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
-
-        tgt_genre_metrics, _ = evaluate_piaa(model, tgt_val_loaders_dict, device, epoch=epoch, phase_name="Val (tgt)")
-
-        if args.is_log:
-            log_dict = {"epoch": epoch}
-            if genre in genre_metrics:
-                log_dict[f"{genre}/Val MAE"] = genre_metrics[genre]['mae']
-                log_dict[f"{genre}/Val SROCC"] = genre_metrics[genre]['srocc']
-                log_dict[f"{genre}/Val NDCG@10"] = genre_metrics[genre]['ndcg@10']
-                log_dict[f"{genre}/Val CCC"] = genre_metrics[genre]['ccc']
-            if hasattr(model, '_eval_component_stats') and genre in model._eval_component_stats:
-                cs = model._eval_component_stats[genre]
-                log_dict[f"{genre}/Val interaction_mean"] = cs['interaction_mean']
-                log_dict[f"{genre}/Val direct_mean"] = cs['direct_mean']
-                log_dict[f"{genre}/Val interaction_ratio"] = cs['ratio']
-            if genre in tgt_genre_metrics:
-                tgt_m = tgt_genre_metrics[genre]
-                log_dict[f"{cdan_target_genre}/Val MAE"] = tgt_m['mae']
-                log_dict[f"{cdan_target_genre}/Val SROCC"] = tgt_m['srocc']
-                log_dict[f"{cdan_target_genre}/Val NDCG@10"] = tgt_m['ndcg@10']
-                log_dict[f"{cdan_target_genre}/Val CCC"] = tgt_m['ccc']
-            wandb.log(log_dict, commit=True)
-
-        prev_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_ccc)
-        cur_lr = optimizer.param_groups[0]['lr']
-        if cur_lr < prev_lr:
-            tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (epoch {epoch}) <<<")
-
-        if val_ccc > best_val_ccc:
-            best_val_ccc = val_ccc
-            patience = 0
-            if args.no_save_model:
-                best_state_dict = copy.deepcopy(model.state_dict())
-            else:
-                os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
-                torch.save(model.state_dict(), best_model_path)
-        else:
-            patience += 1
-            if patience >= args.max_patience_epochs:
-                print(f"CDAN Pretrain: early stopping at epoch {epoch}")
-                break
-
-    if fixed_epochs(args):
-        if args.no_save_model:
-            best_state_dict = copy.deepcopy(model.state_dict())
-        else:
-            torch.save(model.state_dict(), best_model_path)
+    if args.no_save_model:
+        best_state_dict = copy.deepcopy(model.state_dict())
+    else:
+        torch.save(model.state_dict(), best_model_path)
 
     return best_model_path, best_state_dict
 
@@ -444,9 +341,6 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
 def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset,
                      args, device, dirname, experiment_name, backbone_dict,
                      pretrained_model_dict, num_attr, num_pt, cdan_target_genre=None):
-    if getattr(args, 'model_type', 'ICI') != 'ICI':
-        raise NotImplementedError("CDAN finetune supports the ICI model only")
-
     batch_size = args.batch_size
     genres = list(datasets_dict.keys())
     genre = genres[0]
@@ -462,9 +356,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         user_train_src = copy.copy(datasets_dict[genre]['train'])
         user_train_src.data = datasets_dict[genre]['train'].data[
             datasets_dict[genre]['train'].data['user_id'] == uid].reset_index(drop=True)
-        user_val_src = copy.copy(datasets_dict[genre]['val'])
-        user_val_src.data = datasets_dict[genre]['val'].data[
-            datasets_dict[genre]['val'].data['user_id'] == uid].reset_index(drop=True)
 
         tgt_train_mask = tgt_train_piaa_dataset.data['user_id'] == uid
         if tgt_train_mask.sum() == 0:
@@ -475,20 +366,10 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         user_train_tgt = copy.copy(tgt_train_piaa_dataset)
         user_train_tgt.data = tgt_train_piaa_dataset.data[tgt_train_mask].reset_index(drop=True)
 
-        tgt_val_mask = tgt_val_piaa_dataset.data['user_id'] == uid
-        if tgt_val_mask.sum() == 0:
-            raise ValueError(
-                f"User {uid} not found in target genre '{cdan_target_genre}' val_piaa_dataset. "
-                f"All finetune users must exist in the target genre."
-            )
-        user_val_tgt = copy.copy(tgt_val_piaa_dataset)
-        user_val_tgt.data = tgt_val_piaa_dataset.data[tgt_val_mask].reset_index(drop=True)
-
         total_train_src = len(user_train_src)
         total_train_tgt = len(user_train_tgt)
-        total_val_src = len(user_val_src)
-        print(f"User {uid}: train src={total_train_src}, train tgt={total_train_tgt}, val src={total_val_src}")
-        if total_train_src < batch_size or total_train_tgt < batch_size or total_val_src == 0:
+        print(f"User {uid}: train src={total_train_src}, train tgt={total_train_tgt}")
+        if total_train_src < batch_size or total_train_tgt < batch_size:
             print(f"Skipping user {uid}: need >={batch_size} per split")
             continue
 
@@ -496,10 +377,6 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
         tgt_loader = DataLoader(user_train_tgt, batch_size=batch_size, shuffle=True, drop_last=True,
                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
-        val_src_loaders = {genre: DataLoader(user_val_src, batch_size=batch_size, shuffle=False,
-                                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
-        val_tgt_loaders = {genre: DataLoader(user_val_tgt, batch_size=batch_size, shuffle=False,
-                                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
 
         model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
         pretrained_path = pretrained_model_dict[genre]
@@ -507,9 +384,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             raise FileNotFoundError(f"CDAN pretrained model not found: {pretrained_path}")
         try:
             state = torch.load(pretrained_path)
-            incompatible = model_user.load_state_dict(state, strict=False)
-            if incompatible.unexpected_keys:
-                print(f"[load_state_dict] Ignored unexpected keys: {incompatible.unexpected_keys}")
+            model_user.load_state_dict(state)
             print(f"Loaded CDAN pretrain weights from {pretrained_path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load model weights from {pretrained_path}: {e}")
@@ -527,18 +402,13 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         grl = GradientReversalLayer()
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model_user.parameters()), lr=args.lr)
         optimizer_disc = optim.AdamW(discriminator.parameters(), lr=args.lr * 10)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=args.lr_decay_factor, patience=args.lr_patience)
 
         steps_per_epoch = len(src_loader)
         cdan_total_steps = getattr(args, 'da_schedule_epochs', 50) * steps_per_epoch
 
-        best_val_ccc = -float('inf')
-        patience = 0
         global_step = 0
         best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{experiment_name}_finetune.pth')
         scaler = GradScaler('cuda')
-
-        torch.save(model_user.state_dict(), best_model_path)
 
         for epoch in range(args.num_epochs):
             L_y, L_d, L_d_tgt, disc_acc_tgt, global_step = _train_one_epoch_piaa(
@@ -548,47 +418,14 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                 desc_suffix=" finetune")
             lambda_ = get_da_lambda(global_step, cdan_total_steps, getattr(args, 'da_gamma', 10.0))
 
-            if fixed_epochs(args):
-                continue
-
-            genre_metrics, _ = evaluate_piaa(model_user, val_src_loaders, device, epoch=epoch, phase_name="Val (src)")
-            val_ccc = genre_metrics[genre]['ccc'] if genre in genre_metrics else -float('inf')
-
-            tgt_genre_metrics, _ = evaluate_piaa(model_user, val_tgt_loaders, device, epoch=epoch, phase_name="Val (tgt)")
-
             if args.is_log:
-                log_dict = {"epoch": epoch}
-                log_dict[f"{genre}/Train Loss user_{uid}"] = L_y
-                log_dict[f"{genre}/Train Domain Loss user_{uid}"] = L_d
-                log_dict[f"{genre}/Train Domain Loss (tgt) user_{uid}"] = L_d_tgt
-                log_dict[f"{genre}/Train Disc Acc (tgt) user_{uid}"] = disc_acc_tgt
-                log_dict[f"{genre}/CDAN lambda user_{uid}"] = lambda_
-                if genre in genre_metrics:
-                    log_dict[f"{genre}/Val MAE user_{uid}"] = genre_metrics[genre]['mae']
-                    log_dict[f"{genre}/Val SROCC user_{uid}"] = genre_metrics[genre]['srocc']
-                    log_dict[f"{genre}/Val CCC user_{uid}"] = genre_metrics[genre]['ccc']
-                if genre in tgt_genre_metrics:
-                    tgt_m = tgt_genre_metrics[genre]
-                    log_dict[f"{cdan_target_genre}/Val MAE user_{uid}"] = tgt_m['mae']
-                    log_dict[f"{cdan_target_genre}/Val SROCC user_{uid}"] = tgt_m['srocc']
-                    log_dict[f"{cdan_target_genre}/Val CCC user_{uid}"] = tgt_m['ccc']
-                wandb.log(log_dict, commit=True)
+                wandb.log({
+                    "epoch": epoch,
+                    f"{genre}/Train Loss user_{uid}": L_y,
+                    f"{genre}/Train Domain Loss user_{uid}": L_d,
+                    f"{genre}/Train Domain Loss (tgt) user_{uid}": L_d_tgt,
+                    f"{genre}/Train Disc Acc (tgt) user_{uid}": disc_acc_tgt,
+                    f"{genre}/CDAN lambda user_{uid}": lambda_,
+                }, commit=True)
 
-            prev_lr = optimizer.param_groups[0]['lr']
-            scheduler.step(val_ccc)
-            cur_lr = optimizer.param_groups[0]['lr']
-            if cur_lr < prev_lr:
-                tqdm.write(f">>> LR reduced: {prev_lr:.2e} -> {cur_lr:.2e}  (user {uid}, epoch {epoch}) <<<")
-
-            if val_ccc > best_val_ccc:
-                best_val_ccc = val_ccc
-                patience = 0
-                torch.save(model_user.state_dict(), best_model_path)
-            else:
-                patience += 1
-                if patience >= args.max_patience_epochs:
-                    print(f"User {uid}: early stopping at epoch {epoch}")
-                    break
-
-        if fixed_epochs(args):
-            torch.save(model_user.state_dict(), best_model_path)
+        torch.save(model_user.state_dict(), best_model_path)

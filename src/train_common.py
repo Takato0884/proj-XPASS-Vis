@@ -300,6 +300,7 @@ class PIAA_MIR_CrossDomain(nn.Module):
         self.num_attr = num_attr
         self.num_pt = num_pt
         self.genres = genres
+        self.input_dim = input_dim
 
         self.nima_dict = nn.ModuleDict()
         for genre in genres:
@@ -393,15 +394,6 @@ def parse_da_method(da_method: str):
         method, target = da_method.split('-', 1)
         return method, target
     return None, None
-
-
-def fixed_epochs(args) -> bool:
-    """Train for exactly args.num_epochs and keep the final checkpoint.
-
-    Skips per-epoch validation, the plateau LR schedule and early stopping, so a
-    trial never queries validation data during training (R1-6 protocol).
-    """
-    return getattr(args, 'fixed_epochs', False)
 
 
 def da_weight(args, default: float) -> float:

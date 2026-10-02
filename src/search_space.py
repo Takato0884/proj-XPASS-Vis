@@ -16,6 +16,7 @@ note/hparam_proposal.html.
 Spec forms:
     ('log', low, high)      log-uniform float
     ('uniform', low, high)  uniform float
+    number                  fixed value (not searched)
 A spec or trial-0 value may also be a {stage: ...} dict when it differs by stage.
 """
 import hashlib
@@ -37,9 +38,8 @@ METHOD = {
     'SourceOnly': {},
     'DANN': dict(_ADV),
     'CDAN': dict(_ADV),
-    'ALDA': dict(_ADV, alda_threshold={'giaa': ('uniform', 0.0, 0.9),
-                                       'pre': ('uniform', 0.0, 0.6),
-                                       'fine': ('uniform', 0.0, 0.6)}),
+    # PIAA predicts one score, so there is no confidence to threshold: delta = 0 (ALDA's own Table 4 setting).
+    'ALDA': dict(_ADV, alda_threshold={'giaa': ('uniform', 0.0, 0.9), 'pre': 0.0, 'fine': 0.0}),
     'DEEPCORAL': {'coral_lambda': ('log', 1e-1, 1e5)},
     'DJDOT': {'djdot_alpha': ('log', 1e-4, 10.0), 'djdot_lambda_t': ('log', 1e-5, 10.0)},
     'JUMBOT': {'jumbot_eta3': ('log', 1e-1, 1e2), 'jumbot_tau': ('log', 0.05, 5.0)},
@@ -52,7 +52,7 @@ TRIAL0 = {
     'DANN': {'da_weight': 1.0},                        # GRL coefficient capped at 1
     'CDAN': {'da_weight': 1.0},                        # "we fix lambda = 1"
     'ALDA': {'da_weight': 1.0,
-             'alda_threshold': {'giaa': 0.9, 'pre': 0.6, 'fine': 0.6}},  # 0.9 (Office), 0.6 (digits)
+             'alda_threshold': {'giaa': 0.9, 'pre': 0.0, 'fine': 0.0}},  # 0.9 (Office); see METHOD for PIAA
     'DEEPCORAL': {'coral_lambda': 1.0},                # no value in the paper; DomainBed default
     'DJDOT': {'djdot_alpha': 1e-3, 'djdot_lambda_t': 1e-4},
     'JUMBOT': {'jumbot_eta3': 1.0, 'jumbot_tau': 0.5},  # Office-Home
@@ -77,6 +77,8 @@ def _for_stage(value, stage):
 
 
 def _draw(spec, rng):
+    if isinstance(spec, (int, float)):
+        return float(spec)
     kind = spec[0]
     if kind == 'log':
         return float(math.exp(rng.uniform(math.log(spec[1]), math.log(spec[2]))))
