@@ -45,3 +45,6 @@ IEEE_Access_LaTeX_template.zip
 # Local data root (samples symlink + cash/ cache) and checkpoints
 data/
 models_pth/
+
+# Original papers of the compared methods (local reference PDFs)
+papers/
