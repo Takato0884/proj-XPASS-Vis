@@ -710,7 +710,7 @@ class Image_PIAA_HistogramDataset(ImageDataset):
 
 
 GENRES = ['art', 'fashion', 'scenery']
-FEATURE_BACKBONES = ('clip_rn50', 'clip_vit_b16')
+FEATURE_BACKBONES = ('resnet50', 'vit_b_16', 'clip_rn50', 'clip_vit_b16')
 
 
 def load_image_features(root_dir, backbone, genre, maked_dir=None, device=None, batch_size=64):
@@ -768,7 +768,7 @@ def load_group_split(split_dir, fold):
 class GroupSplitData:
     """Datasets of one genre for one fold of the group split.
 
-    GIAA: per-image score histograms from train users (train) or val users (val).
+    GIAA: per-image score histograms from train, val or test users (role 'train', 'val' or 'test').
     PIAA pre: individual ratings of train users (train) or val users (val).
     PIAA fine: each user's 'train' / 'eval' samples listed in fine_samples.csv.
     With args.feature_cache, every stage feeds cached frozen-backbone features (no augmentation).
@@ -800,7 +800,7 @@ class GroupSplitData:
     def giaa(self, role):
         if role not in self._giaa:
             is_train = role == 'train'
-            rows = self._rows(self.split['train_users'] if is_train else self.split['val_users'])
+            rows = self._rows(self.split[f'{role}_users'])
             if is_train:
                 rows = rows[rows['sample_id'].isin(self.split['giaa_train_images'])]
             ensure_dir_exists(self.pkl_dir)
