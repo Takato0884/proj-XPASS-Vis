@@ -5,7 +5,7 @@ each starting from the configuration selected in the previous stage:
 
     giaa  NIMA on train users' score histograms   selected by EMD on val users' images
     pre   PIAA on train users' ratings            selected by MSE on val users' ratings
-                                                  (mean per-user SCC also recorded)
+                                                  (or mean per-user SCC on them, --pre_metric scc)
     fine  per-user fine-tuning of the val users   selected by mean per-user SCC on their eval samples
 
 and the test users are then fine-tuned with the selected configuration and
@@ -50,6 +50,7 @@ import json
 import math
 import os
 import random
+import socket
 import sys
 import time
 
@@ -68,6 +69,7 @@ from .train_common import NIMA, build_piaa_model, num_bins
 DA_METHODS = ['DANN', 'DJDOT', 'JUMBOT', 'DEEPCORAL', 'CDAN', 'ALDA', 'DAREGRAM', 'RSD']
 NO_GIAA = {'DAREGRAM', 'RSD'}
 CRITERIA = ['train_domain', 'oracle']
+PRE_METRICS = {'mse': ('val_loss', True), 'scc': ('val_scc', False)}  # record field, minimize
 SEED = 42  # every training run (each trial, and each user's fine-tuning) starts from this seed
 
 
@@ -81,6 +83,8 @@ def parse_cli():
     parser.add_argument('--n_trials', type=int, default=20, help='Configurations per stage, common to all methods')
     parser.add_argument('--search_seed', type=int, default=0)
     parser.add_argument('--criteria', type=str, nargs='+', default=CRITERIA, choices=CRITERIA)
+    parser.add_argument('--pre_metric', type=str, default='mse', choices=list(PRE_METRICS),
+                        help='Pre-stage selection metric; both are recorded per trial, so scc reuses the pre trials')
     parser.add_argument('--no_feature_cache', action='store_true',
                         help='Feed augmented images to the frozen backbone instead of cached features (all stages)')
     parser.add_argument('--stop_after', type=str, default=None, choices=['giaa', 'pre', 'fine'],
@@ -90,7 +94,8 @@ def parse_cli():
     parser.add_argument('--root_dir', type=str, default='data', help='Contains samples/ and the cash/ cache')
     parser.add_argument('--backbone', type=str, default='clip_vit_b16',
                         choices=['resnet50', 'vit_b_16', 'clip_rn50', 'clip_vit_b16'])
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='Items are prebuilt in memory, so loader workers only add start-up cost')
     parser.add_argument('--out_dir', type=str, default='output/r16', help='Results, predictions and logs')
     parser.add_argument('--models_dir', type=str, default='models_pth/r16')
     cli = parser.parse_args()
@@ -109,6 +114,12 @@ def _seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _device():
+    """Where a run executed, so the status page can tell the machines apart."""
+    gpu = torch.cuda.get_device_name() if torch.cuda.is_available() else 'cpu'
+    return {'host': socket.gethostname(), 'gpu': gpu}
 
 
 def _read_json(path):
@@ -194,7 +205,7 @@ class Sweep:
 
     def loader(self, dataset, batch_size, train=False):
         return DataLoader(dataset, batch_size=batch_size, shuffle=train, drop_last=train,
-                          num_workers=self.cli.num_workers, timeout=300, collate_fn=collate_fn)
+                          num_workers=self.cli.num_workers, timeout=300 if self.cli.num_workers else 0, collate_fn=collate_fn)
 
     def args(self, genre, method=None, target=None, hp=None):
         args = parse_arguments(parse=False).parse_args(['--genre', genre])
@@ -269,6 +280,7 @@ class Sweep:
         del model, optimizer, components
         self._release()
         return {'stage': 'giaa', 'key': _key_name(key), 'trial': t, 'seed': SEED, 'hparams': hp,
+                'device': _device(),
                 'metric': 'EMD on val users images', 'val_loss': val_loss, 'ckpt': ckpt}
 
     # ---------- pre ----------
@@ -320,6 +332,7 @@ class Sweep:
         del model
         self._release()
         return {'stage': 'pre', 'key': _key_name(key), 'base': _trial_id(giaa), 'trial': t, 'seed': SEED,
+                'device': _device(),
                 'hparams': hp, 'metric': 'MSE on val users ratings (val_loss); mean per-user SCC on them (val_scc)',
                 'val_loss': val_loss, 'val_scc': val_scc, 'ckpt': ckpt}
 
@@ -337,6 +350,7 @@ class Sweep:
                 print(f'\n[fine] {_key_name(key)} on {_pre_id(pre)} trial {t}: {hp}')
                 result = self._fine_users(key, pre, hp, self.split['val_users'], f'fine-t{t:03d}')
                 record = {'stage': 'fine', 'key': _key_name(key), 'base': _pre_id(pre), 'trial': t, 'seed': SEED,
+                          'device': _device(),
                           'hparams': hp, 'metric': 'mean per-user SCC on val users eval samples',
                           'val_scc': result['scc'], 'val_ccc': result['ccc'], 'per_user': result['per_user'],
                           'per_user_ccc': result['per_user_ccc']}
@@ -355,6 +369,7 @@ class Sweep:
             result = self._fine_users(key, pre, fine['hparams'], self.split['test_users'], f"test-t{fine['trial']:03d}",
                                       pred_path=pred_path)
             record = {'stage': 'test', 'key': _key_name(key), 'base': _pre_id(pre), 'fine_trial': fine['trial'],
+                      'device': _device(),
                       'hparams': fine['hparams'], 'metric': 'mean per-user SCC and CCC on test users eval samples',
                       'test_scc': result['scc'], 'test_ccc': result['ccc'], 'per_user': result['per_user'],
                       'per_user_ccc': result['per_user_ccc'], 'predictions': pred_path}
@@ -442,7 +457,8 @@ class Sweep:
         if self.cli.stop_after == 'giaa':
             return None
         pre_records = self.pre_trials(key, giaa)
-        pre = _best(pre_records, 'val_loss', sel, minimize=True)
+        pre_field, pre_minimize = PRE_METRICS[self.cli.pre_metric]
+        pre = _best(pre_records, pre_field, sel, minimize=pre_minimize)
         if self.cli.stop_after == 'pre':
             return None
         fine_records = self.fine_trials(key, pre)
@@ -455,9 +471,9 @@ class Sweep:
         return {
             'fold': self.cli.fold, 'model_type': self.cli.model_type, 'method': method,
             'source': src, 'target': tgt, 'criterion': criterion, 'selection_domain': sel,
-            'n_trials': self.cli.n_trials, 'search_seed': self.cli.search_seed,
+            'pre_metric': self.cli.pre_metric, 'n_trials': self.cli.n_trials, 'search_seed': self.cli.search_seed,
             'selected': {'giaa': dict(stage(giaa, 'val_loss'), key=giaa['key']),
-                         'pre': stage(pre, 'val_loss'), 'fine': stage(fine, 'val_scc')},
+                         'pre': stage(pre, pre_field), 'fine': stage(fine, 'val_scc')},
             'test_scc': test['test_scc'],
             'test_ccc': test['test_ccc'],
             'per_user': test['per_user'],
@@ -467,6 +483,7 @@ class Sweep:
 
     def run(self):
         cli = self.cli
+        suffix = '' if cli.pre_metric == 'mse' else f'_pre-{cli.pre_metric}'
         if cli.method == 'TargetOnly':
             # Source-Only trained and selected on the target domain; one criterion.
             result = self.run_chain('SourceOnly', cli.target, None, 'train_domain')
@@ -474,7 +491,7 @@ class Sweep:
                 print(f'TargetOnly {cli.target}: stopped after {cli.stop_after}')
                 return
             result.update(method='TargetOnly', source=cli.target, target=cli.target, criterion='target')
-            path = os.path.join(self.report_dir, cli.model_type, 'final', f'TargetOnly_{cli.target}.json')
+            path = os.path.join(self.report_dir, cli.model_type, 'final', f'TargetOnly_{cli.target}{suffix}.json')
             _write_json(path, result)
             print(f"TargetOnly {cli.target}: test SCC = {result['test_scc'][cli.target]:.4f}, "
                   f"CCC = {result['test_ccc'][cli.target]:.4f} -> {path}")
@@ -486,7 +503,7 @@ class Sweep:
                 if result is None:
                     print(f'{cli.method} {cli.source}->{tgt} [{criterion}]: stopped after {cli.stop_after}')
                     continue
-                name = f'{cli.method}_{cli.source}2{tgt}_{criterion}.json'
+                name = f'{cli.method}_{cli.source}2{tgt}_{criterion}{suffix}.json'
                 path = os.path.join(self.report_dir, cli.model_type, 'final', name)
                 _write_json(path, result)
                 print(f"{cli.method} {cli.source}->{tgt} [{criterion}]: "
@@ -529,6 +546,8 @@ def _start_log(cli):
     sys.stdout = _Tee(sys.stdout, log, skip_redraws=False)
     sys.stderr = _Tee(sys.stderr, log, skip_redraws=True)
     print(f'Log: {path}')
+    device = _device()
+    print(f"Device: {device['host']} / {device['gpu']}")
 
 
 if __name__ == '__main__':
