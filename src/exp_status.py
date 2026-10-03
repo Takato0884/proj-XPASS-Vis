@@ -46,10 +46,12 @@ PRE_METRICS = {'mse': ('val_loss', True), 'scc': ('val_scc', False)}  # as src.s
 # Known machines: hostname -> (label, colour). Unknown hosts get the next palette colour, labelled
 # with their hostname and GPU. Records written before devices were recorded count as MAIN_HOST.
 MAIN_HOST = 'hayashi0884-Z690-S01'
-MACHINES = {MAIN_HOST: ('メイン機', '#2a78d6'), 'a156d1e4b161': ('クラウド3090', '#e07b00')}
+MACHINES = {MAIN_HOST: ('メイン機', '#2a78d6'), 'a156d1e4b161': ('クラウド3090', '#e07b00'),
+            'eaa4b40fa4ec': ('クラウド3090-2', '#1a9a6c')}
 PALETTE = ['#e07b00', '#1a9a6c', '#b4489a', '#7a5af0', '#c0392b']
 # Queue origin -> (host its jobs run on, jobs it runs at once). `local` is this machine, one job at a time
 # (run_sourceonly_oracle.sh); the pod's run_da.sh / run_giaa_da.sh run 5 jobs through xargs -P 5.
+# The two pods share one network volume; run_da_shared.sh's queue gives its total parallelism by `# parallel N`.
 ORIGINS = {'pod': ('a156d1e4b161', 5)}
 PARALLEL = {}  # (origin, queue name) -> jobs at once, from a queue file's `# parallel N` line (overrides ORIGINS)
 
