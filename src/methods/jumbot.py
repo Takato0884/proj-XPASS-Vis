@@ -12,7 +12,7 @@ from tqdm import tqdm
 import copy
 from torch.utils.data import DataLoader
 
-from ..train_common import earth_mover_distance, build_piaa_model, num_bins
+from ..train_common import earth_mover_distance, build_piaa_model, load_weights, num_bins, save_weights
 from ..data import collate_fn
 
 
@@ -175,9 +175,9 @@ def trainer(src_dataloaders, tgt_loader, model, optimizer, args, device, best_mo
             }, commit=True)
 
     os.makedirs(os.path.dirname(best_modelname), exist_ok=True)
-    torch.save(model.state_dict(), best_modelname)
+    save_weights(model, best_modelname)
 
-    model.load_state_dict(torch.load(best_modelname))
+    load_weights(model, best_modelname)
 
 
 def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, device, args, genre,
@@ -283,8 +283,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     if not os.path.exists(pretrained_path):
         raise FileNotFoundError(f"Pretrained NIMA model not found: {pretrained_path}")
     try:
-        state = torch.load(pretrained_path)
-        model.nima_dict[genre].load_state_dict(state)
+        load_weights(model.nima_dict[genre], pretrained_path)
         print(f"Loaded NIMA weights for {genre} from {pretrained_path}")
     except Exception as e:
         raise RuntimeError(f"Failed to load NIMA weights for {genre}: {e}")
@@ -331,7 +330,7 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     if args.no_save_model:
         best_state_dict = copy.deepcopy(model.state_dict())
     else:
-        torch.save(model.state_dict(), best_model_path)
+        save_weights(model, best_model_path)
 
     return best_model_path, best_state_dict
 
@@ -382,8 +381,7 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
         if pretrained_path is None or not os.path.exists(pretrained_path):
             raise FileNotFoundError(f"JUMBOT pretrained model not found: {pretrained_path}")
         try:
-            state = torch.load(pretrained_path)
-            model_user.load_state_dict(state)
+            load_weights(model_user, pretrained_path)
             print(f"Loaded JUMBOT pretrain weights from {pretrained_path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load model weights from {pretrained_path}: {e}")
@@ -427,4 +425,4 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
                     f"{genre}/Train OT Marginal Dev user_{uid}": ot_marg_dev,
                 }, commit=True)
 
-        torch.save(model_user.state_dict(), best_model_path)
+        save_weights(model_user, best_model_path)

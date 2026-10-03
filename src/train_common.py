@@ -378,6 +378,39 @@ def build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args):
             dropout=args.dropout)
 
 
+def _backbone_prefixes(model, frozen_only):
+    """State-dict prefixes of the image backbones in `model` (NIMA.backbone, possibly nested in nima_dict)."""
+    return tuple(f'{name}.' for name, module in model.named_modules()
+                 if name.split('.')[-1] == 'backbone'
+                 and not (frozen_only and any(p.requires_grad for p in module.parameters())))
+
+
+def save_weights(model, path):
+    """Save the state dict without its frozen backbones (~97% of a checkpoint's bytes).
+
+    A frozen backbone stays at its pretrained weights, so load_weights restores it from the freshly
+    built model; a backbone with trainable parameters is saved in full.
+    """
+    frozen = _backbone_prefixes(model, frozen_only=True)
+    state = model.state_dict()
+    torch.save({k: v for k, v in state.items() if not (frozen and k.startswith(frozen))}, path)
+
+
+def load_weights(model, path, map_location=None):
+    """Load a checkpoint from save_weights (or a full one); omitted backbones keep the model's pretrained weights.
+
+    `model` must be freshly built, so its backbones hold the pretrained weights. A backbone is either
+    wholly present or wholly omitted; any other missing or unexpected key raises, as in a strict load.
+    """
+    state = torch.load(path, map_location=map_location)
+    own = model.state_dict()
+    for prefix in _backbone_prefixes(model, frozen_only=False):
+        keys = [k for k in own if k.startswith(prefix)]
+        if not any(k in state for k in keys):
+            state.update({k: own[k] for k in keys})
+    model.load_state_dict(state)
+
+
 def discover_folds(root_dir, version_prefix):
     split_dir = os.path.join(root_dir, 'split')
     folds = sorted([

@@ -64,7 +64,7 @@ from .argflags import parse_arguments
 from .data import GENRES, GroupSplitData, build_global_encoders, collate_fn, load_group_split
 from .evaluate import evaluate, evaluate_piaa, evaluate_piaa_pre
 from .search_space import sample_hparams
-from .train_common import NIMA, build_piaa_model, num_bins
+from .train_common import NIMA, build_piaa_model, load_weights, num_bins
 
 DA_METHODS = ['DANN', 'DJDOT', 'JUMBOT', 'DEEPCORAL', 'CDAN', 'ALDA', 'DAREGRAM', 'RSD']
 NO_GIAA = {'DAREGRAM', 'RSD'}
@@ -324,7 +324,7 @@ class Sweep:
                                            domain_tag=f'{src}2{tgt}')
 
         model = build_piaa_model(num_bins, num_attr, num_pt, [src], backbone_dict, args).to(self.device)
-        model.load_state_dict(torch.load(ckpt))
+        load_weights(model, ckpt)
         val_loss, val_scc = {}, {}
         for g in self.eval_genres(key):
             val_loss[g], val_scc[g] = evaluate_piaa_pre(model, self.loader(self.data(g).pre('val'), args.batch_size),
@@ -410,7 +410,7 @@ class Sweep:
                                      **{f'{method.lower()}_target_genre': tgt})
             ckpt = os.path.join(tmp_dir, f'{src}_{args.model_type}_user_{uid}_{exp}_finetune.pth')
             model = build_piaa_model(num_bins, num_attr, num_pt, [src], backbone_dict, args).to(self.device)
-            model.load_state_dict(torch.load(ckpt))
+            load_weights(model, ckpt)
             os.remove(ckpt)
             per_user[str(uid)] = {}
             per_user_ccc[str(uid)] = {}

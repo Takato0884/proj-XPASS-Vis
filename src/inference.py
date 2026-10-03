@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import collate_fn
-from .train_common import num_bins
+from .train_common import load_weights, num_bins
 
 
 def _build_eval_model(num_bins_, num_attr, num_pt, genres, backbone_dict, args, device):
@@ -317,7 +317,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
         best_model_path = os.path.join(dirname, f'{genre_str}_{args.model_type}_user_{uid}_{model_name_base}_finetune.pth')
         model_user = _build_eval_model(num_bins, num_attr, num_pt, genres, backbone_dict, args, device)
         try:
-            model_user.load_state_dict(torch.load(best_model_path))
+            load_weights(model_user, best_model_path)
         except Exception as e:
             print(f"Warning: best model not found for user {uid} at {best_model_path}, skipping. Error: {e}")
             results[uid] = (np.nan, np.nan)
@@ -491,7 +491,7 @@ def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dic
     if model_state_dict is not None:
         model.load_state_dict(model_state_dict)
     else:
-        model.load_state_dict(torch.load(best_model_path))
+        load_weights(model, best_model_path)
 
     all_user_ids = set(datasets_dict_user[genre]['val'].data['user_id'].values)
     unique_user_ids = sorted(list(all_user_ids))
@@ -531,7 +531,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
     if model_state_dict is not None:
         model.load_state_dict(model_state_dict)
     else:
-        model.load_state_dict(torch.load(best_model_path))
+        load_weights(model, best_model_path)
 
     all_user_ids = set(datasets_dict[genre]['test'].data['user_id'].values)
     unique_user_ids = sorted(list(all_user_ids))
@@ -671,7 +671,7 @@ def _run_giaa(model_path: str, genre: str, fold: str, cli, device):
 
     print(f"  Loading NIMA model from {model_path} ...")
     model = NIMA(num_bins, backbone=args.backbone, dropout=args.dropout).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    load_weights(model, model_path, map_location=device)
     model.eval()
 
     print(f"  Running GIAA inference (Test) ...")
