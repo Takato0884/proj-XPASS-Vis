@@ -12,8 +12,8 @@ does not exist yet.
 A chain is queued (実行予約) when a launcher has registered it in <out_dir>/queue/ and it is neither done
 nor running. Launchers write one file per queue, `queue/<origin>/<name>.txt`, with one line per job
     fold model_type method source target criteria stop
-(target `*` = every other domain, criteria comma-separated, stop = --stop_after or `-`), and delete it
-on exit. `origin` is `local` for queues of this machine; output/r16/pull_pod.sh mirrors the pod's
+(target `*` = every other domain, `-` = Target-Only on the source domain, criteria comma-separated, stop = --stop_after or `-`), and delete it
+on exit. A line `# parallel N` gives the jobs the launcher runs at once (for the ETA). `origin` is `local` for queues of this machine; output/r16/pull_pod.sh mirrors the pod's
 queue/local/ into queue/pod/.
 
 Usage:
@@ -28,8 +28,10 @@ import json
 import math
 import os
 import re
+import socket
+import statistics
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 
 # Mirrors src.sweep / src.data; kept literal so this script needs neither torch nor cv2.
 GENRES = ['art', 'fashion', 'scenery']
@@ -46,6 +48,10 @@ PRE_METRICS = {'mse': ('val_loss', True), 'scc': ('val_scc', False)}  # as src.s
 MAIN_HOST = 'hayashi0884-Z690-S01'
 MACHINES = {MAIN_HOST: ('メイン機', '#2a78d6'), 'a156d1e4b161': ('クラウド3090', '#e07b00')}
 PALETTE = ['#e07b00', '#1a9a6c', '#b4489a', '#7a5af0', '#c0392b']
+# Queue origin -> (host its jobs run on, jobs it runs at once). `local` is this machine, one job at a time
+# (run_sourceonly_oracle.sh); the pod's run_da.sh / run_giaa_da.sh run 5 jobs through xargs -P 5.
+ORIGINS = {'pod': ('a156d1e4b161', 5)}
+PARALLEL = {}  # (origin, queue name) -> jobs at once, from a queue file's `# parallel N` line (overrides ORIGINS)
 
 
 def parse_cli():
@@ -56,6 +62,8 @@ def parse_cli():
     parser.add_argument('--pre_metric', type=str, default='mse', choices=list(PRE_METRICS),
                         help='Pre-stage selection metric of the chains shown, as in src.sweep')
     parser.add_argument('--running_min', type=float, default=15, help='A log newer than this counts as live')
+    parser.add_argument('--eta_hours', type=float, default=12,
+                        help='Trial durations for the ETA come from records written in the last N hours')
     parser.add_argument('--watch', type=float, default=0, help='Regenerate every N seconds (0: once)')
     return parser.parse_args()
 
@@ -124,24 +132,29 @@ class Machines:
 # ---------- queued chains, from the launchers' queue files ----------
 
 def load_queue(out_dir):
-    """Jobs registered by live launchers: list of (fold, model_type, method, src, tgt or '*', criteria, stop, origin)."""
+    """Jobs registered by live launchers: list of (fold, model_type, method, src, tgt or '*', criteria, stop, origin, name)."""
     jobs = []
     for path in glob.glob(os.path.join(out_dir, 'queue', '*', '*.txt')):
         origin = os.path.basename(os.path.dirname(path))
+        name = os.path.splitext(os.path.basename(path))[0]
         with open(path, errors='replace') as f:
             for line in f:
                 parts = line.split()
+                if parts[:2] == ['#', 'parallel'] and len(parts) == 3:
+                    PARALLEL[(origin, name)] = int(parts[2])
+                    continue
                 if len(parts) != 7:
                     continue
                 fold, model_type, method, src, tgt, criteria, stop = parts
+                tgt = None if tgt == '-' else tgt  # '-': Target-Only (src.sweep --method TargetOnly --target src)
                 jobs.append((int(fold), model_type, method, src, tgt, set(criteria.split(',')),
-                             None if stop == '-' else stop, origin))
+                             None if stop == '-' else stop, origin, name))
     return jobs
 
 
 def queued_by(queue, fold, model_type, method, src, tgt, criterion, stages, n_trials):
     """The origin of the first queued job that still has work on this chain, or None."""
-    for q_fold, q_mt, q_method, q_src, q_tgt, q_criteria, q_stop, origin in queue:
+    for q_fold, q_mt, q_method, q_src, q_tgt, q_criteria, q_stop, origin, _ in queue:
         if (q_fold, q_method, q_src) != (fold, method, src) or criterion not in q_criteria:
             continue
         if q_tgt != '*' and q_tgt != tgt:
@@ -200,11 +213,12 @@ def _chain(out_dir, fold, model_type, method, src, tgt, criterion, n_trials, pre
     key = f'SourceOnly_{src}' if method == 'SourceOnly' else f'{method}_{src}2{tgt}'
     giaa_key = f'SourceOnly_{src}' if method in NO_GIAA or method == 'SourceOnly' else key
     res = os.path.join(out_dir, 'results', f'fold{fold}')
-    stages = {s: {'n': 0, 'hosts': Counter(), 'running': None} for s in STAGES}
+    stages = {s: {'n': 0, 'hosts': Counter(), 'running': None, 'id': None} for s in STAGES}
 
     def collect(stage, records, live_key):
         info = stages[stage]
         info['n'] = len(records)
+        info['id'] = live_key
         for r in records:
             info['hosts'][_host(r)] += 1
             machines.see((fold, live_key, r['trial']), r)
@@ -238,6 +252,7 @@ def _chain(out_dir, fold, model_type, method, src, tgt, criterion, n_trials, pre
 
     test = _read_json(os.path.join(res, model_type, 'test', key, pre_id, f"fine-t{fine['trial']:03d}.json"))
     info = stages['test']
+    info['id'] = (fold, model_type, 'test', key, pre_id, fine['trial'])
     if test:
         info['n'] = n_trials  # drawn as a full bar
         info['hosts'][_host(test)] += 1
@@ -258,6 +273,139 @@ def chain_state(c, n_trials):
     if c['queued']:
         return 'queued'
     return 'todo'
+
+
+# ---------- ETA of the queued work ----------
+
+def stage_durations(out_dir, hours):
+    """(host, model, stage) -> median seconds per trial, from records written in the last `hours` hours.
+
+    `model` is the PIAA model (ICI, MIR), or None for GIAA, since the PIAA models differ greatly in speed.
+
+    A trial's duration is the gap between consecutive records in one directory (one job writes them in
+    order, so the gap includes the slowdown from jobs running beside it); a test's duration is the gap
+    between its fine stage's last record and the test record.
+    """
+    since = time.time() - hours * 3600
+    gaps = defaultdict(list)
+    res = os.path.join(out_dir, 'results')
+    by_dir = defaultdict(list)
+    for pattern in ['fold*/giaa/*/t[0-9][0-9][0-9].json', 'fold*/*/pre/*/*/t[0-9][0-9][0-9].json',
+                    'fold*/*/fine/*/*/t[0-9][0-9][0-9].json']:
+        for path in glob.glob(os.path.join(res, pattern)):
+            by_dir[os.path.dirname(path)].append(os.path.getmtime(path))
+    last_fine = {}
+    for directory, mtimes in by_dir.items():
+        mtimes.sort()
+        if mtimes[-1] < since:
+            continue
+        parts = directory.split(os.sep)
+        stage, model = ('giaa', None) if f'{os.sep}giaa{os.sep}' in directory else (parts[-3], parts[-4])
+        if stage == 'fine':
+            last_fine[directory] = mtimes[-1]
+        record = _read_json(glob.glob(os.path.join(directory, 't[0-9][0-9][0-9].json'))[-1])
+        host = _host(record) if record else MAIN_HOST
+        gaps[(host, model, stage)] += [b - a for a, b in zip(mtimes, mtimes[1:]) if a >= since]
+    for path in glob.glob(os.path.join(res, 'fold*/*/test/*/*/fine-t[0-9][0-9][0-9].json')):
+        end = os.path.getmtime(path)
+        fine_dir = os.path.dirname(path).replace(f'{os.sep}test{os.sep}', f'{os.sep}fine{os.sep}')
+        if end >= since and fine_dir in last_fine and end > last_fine[fine_dir]:
+            record = _read_json(path)
+            model = path.split(os.sep)[-5]
+            gaps[(_host(record) if record else MAIN_HOST, model, 'test')].append(end - last_fine[fine_dir])
+    return {k: statistics.median(v) for k, v in gaps.items() if v}
+
+
+def _duration(durations, host, model, stage):
+    """Seconds per trial of `stage` of `model` on `host`, falling back to the median over other hosts; None if unknown."""
+    model = None if stage == 'giaa' else model
+    if (host, model, stage) in durations:
+        return durations[(host, model, stage)]
+    others = [v for (h, m, s), v in durations.items() if (m, s) == (model, stage)]
+    return statistics.median(others) if others else None
+
+
+def queue_etas(cli, queue, durations):
+    """One entry per launcher queue: its remaining trials per stage and the estimated finishing time."""
+    machines = Machines()  # throwaway: chain() registers hosts, which must not affect the page's counts
+    local_host = socket.gethostname()
+    by_name = defaultdict(list)
+    for job in queue:
+        by_name[(job[7], job[8])].append(job)
+    out = []
+    for (origin, name), jobs in sorted(by_name.items()):
+        host, parallel = ORIGINS.get(origin, (local_host, 1))
+        parallel = PARALLEL.get((origin, name), parallel)
+        units, chains = {}, 0
+        for fold, model_type, method, src, tgt, criteria, stop, _, _ in jobs:
+            targets = [t for t in GENRES if t != src] if tgt == '*' else [tgt]
+            stages = STAGES[:STAGES.index(stop) + 1] if stop else STAGES
+            for criterion in sorted(criteria):
+                for t in targets:
+                    c = _chain(cli.out_dir, fold, model_type, method, src, t, criterion, cli.n_trials,
+                               cli.pre_metric, {}, machines)
+                    if c['test'] or (stop and c['stages'][stop]['n'] >= cli.n_trials):
+                        continue
+                    chains += 1
+                    for stage in stages:
+                        s = c['stages'][stage]
+                        left = (0 if c['test'] else 1) if stage == 'test' else cli.n_trials - s['n']
+                        if left > 0:
+                            # Stages not reached yet have no id; they count once per chain.
+                            units[s['id'] or (fold, model_type, method, src, t, criterion, stage)] = (model_type, stage, left)
+        left, unknown, seconds = Counter(), set(), 0.0
+        for model, stage, n in units.values():
+            left[stage] += n
+            d = _duration(durations, host, model, stage)
+            if d is None:
+                unknown.add(stage)
+            else:
+                seconds += n * d
+        seconds /= parallel
+        out.append({'name': name, 'origin': origin, 'host': host, 'parallel': parallel, 'chains': chains,
+                    'left': left, 'seconds': seconds, 'unknown': unknown})
+    return out
+
+
+def _hm(seconds):
+    minutes = int(round(seconds / 60))
+    return f'{minutes // 60}時間{minutes % 60:02d}分' if minutes >= 60 else f'{minutes}分'
+
+
+def eta_html(etas, durations, machines, n_trials):
+    now = time.time()
+    hosts = sorted({h for h, _, _ in durations}, key=lambda h: h != MAIN_HOST)
+    speed = ' ・ '.join(
+        f"{html.escape(machines.label(h))} {m or 'GIAA'}: " + ' / '.join(
+            f"{STAGE_LABEL[s]} {durations[(h, m, s)] / 60:.1f}分" for s in STAGES if (h, m, s) in durations)
+        for h in hosts for m in [None] + MODEL_TYPES if any((h, m, s) in durations for s in STAGES))
+    if not etas:
+        return (f'<section><h2>完走予想</h2><p class="note">実行予約・実行中のキューはありません。'
+                f'1 trial の所要時間: {speed or "記録なし"}</p></section>')
+    rows = []
+    finish = {}
+    for e in sorted(etas, key=lambda e: e['seconds']):
+        end = now + e['seconds']
+        finish[e['host']] = max(finish.get(e['host'], 0), end)
+        left = ' '.join(f"{STAGE_LABEL[s]}{e['left'][s]}" for s in STAGES if e['left'][s])
+        warn = f" <small>（{'/'.join(STAGE_LABEL[s] for s in STAGES if s in e['unknown'])} の所要時間不明・除外）</small>" \
+            if e['unknown'] else ''
+        rows.append(f"<tr><td><i class=\"sw\" style=\"background:{machines.colour(e['host'])}\"></i>"
+                    f"{html.escape(e['name'])}</td><td>{html.escape(machines.label(e['host']))}</td>"
+                    f"<td class=\"num\">{e['parallel']}</td><td class=\"num\">{e['chains']}</td><td>{left or '–'}</td>"
+                    f"<td class=\"num\">{_hm(e['seconds'])}</td>"
+                    f"<td class=\"num\"><b>{time.strftime('%m/%d %H:%M', time.localtime(end))}</b>{warn}</td></tr>")
+    overall = ' ・ '.join(f"{html.escape(machines.label(h))} <b>{time.strftime('%m/%d %H:%M', time.localtime(t))}</b>"
+                          for h, t in sorted(finish.items(), key=lambda x: x[1]))
+    return (f'<section><h2>完走予想</h2>'
+            f'<p class="note">キューの残り trial 数 × マシン・段ごとの 1 trial 所要時間（直近の記録の中央値）÷ 並列数。'
+            f'実行中の trial の経過分は差し引かず、選択前の段はチェーンごとに別 trial として数えるため、やや遅めに出ます。'
+            f'失敗して終わったジョブも残りとして数えます。</p>'
+            f'<div class="summary"><span>完走予想（マシン別）</span> {overall}</div>'
+            f'<div class="scroll"><table class="eta"><thead><tr><th>キュー</th><th>マシン</th><th>並列</th>'
+            f'<th>残りチェーン</th><th>残り trial（G/P/F/T）</th><th>残り時間</th><th>完走予想</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>'
+            f'<p class="note">1 trial の所要時間: {speed}（1 段 {n_trials} trial）</p></section>')
 
 
 # ---------- html ----------
@@ -323,7 +471,8 @@ def summary_html(rows, n_trials):
 def build(cli):
     machines = Machines()
     live = live_markers(cli.out_dir, cli.running_min)
-    args = (cli.n_trials, cli.pre_metric, live, machines, load_queue(cli.out_dir))
+    queue = load_queue(cli.out_dir)
+    args = (cli.n_trials, cli.pre_metric, live, machines, queue)
     sections = []
     for criterion, title, note in [
             ('oracle', 'Cross-domain ・ oracle 基準（本文）', '選択: val ユーザーのターゲットドメイン'),
@@ -342,7 +491,9 @@ def build(cli):
                                for mt in MODEL_TYPES for f in FOLDS}) for d in GENRES]
     sections.append(('Within-domain ・ Target-Only', '学習・選択・評価とも同一ドメイン（基準の区別なし）', rows))
 
-    body = ''.join(f'<section><h2>{html.escape(t)}</h2><p class="note">{html.escape(n)}</p>'
+    durations = stage_durations(cli.out_dir, cli.eta_hours)
+    body = eta_html(queue_etas(cli, queue, durations), durations, machines, cli.n_trials)
+    body += ''.join(f'<section><h2>{html.escape(t)}</h2><p class="note">{html.escape(n)}</p>'
                    f'{summary_html(r, cli.n_trials)}{table_html(r, cli.n_trials, machines)}</section>'
                    for t, n, r in sections)
     legend = ''.join(f'<span class="key"><i style="background:{machines.colour(h)}"></i>{html.escape(machines.label(h))}'
@@ -400,6 +551,8 @@ td.done {{ background:var(--done); }} td.running {{ background:var(--run); }} td
   background-size:14px 14px; animation:slide 1s linear infinite; }}
 @keyframes slide {{ from {{ background-position:0 0; }} to {{ background-position:14px 0; }} }}
 @media (prefers-reduced-motion: reduce) {{ .bar.running .fill {{ animation:none; }} }}
+table.eta td {{ white-space:nowrap; }} td.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
+.sw {{ display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; }}
 .scc {{ display:block; text-align:right; font-variant-numeric:tabular-nums; color:var(--muted); font-size:11px; }}
 </style></head><body>
 <header>
