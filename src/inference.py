@@ -27,7 +27,7 @@ def inference_giaa(test_dataset, args, device, model, model_path=None, eval_data
 
     batch_size = args.batch_size
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                             num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                             num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
 
     test_emd, test_srocc, _, test_mse, _, test_mae, test_ccc = evaluate(
         model, test_loader, device, phase_name="Test")
@@ -41,7 +41,7 @@ def inference_giaa(test_dataset, args, device, model, model_path=None, eval_data
             print(f"\n[Cross-Domain] Evaluating {args.genre} GIAA model on {target_genre} GIAA test set...")
             target_test_ds = ds_dict['test']
             target_loader = DataLoader(target_test_ds, batch_size=batch_size, shuffle=False,
-                                       num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                       num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
             cd_emd, cd_srocc, _, cd_mse, _, cd_mae, cd_ccc = evaluate(
                 model, target_loader, device, phase_name="Test")
             cross_domain_results[target_genre] = {
@@ -131,7 +131,7 @@ def inference(train_dataset, val_dataset, test_dataset, args, device, model, eva
             print(f"No test samples for user {uid}, skipping.")
             continue
 
-        user_test_loader = DataLoader(user_test_ds, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+        user_test_loader = DataLoader(user_test_ds, batch_size=batch_size, shuffle=False, num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         _, _, final_srocc, final_mse, final_ndcg, final_mae, final_ccc = evaluate(model, user_test_loader, device, PIAA=True)
 
         user_sroccs.append(final_srocc if final_srocc is not None else np.nan)
@@ -196,7 +196,7 @@ def inference(train_dataset, val_dataset, test_dataset, args, device, model, eva
                     continue
 
                 user_cd_loader = DataLoader(user_cd_ds, batch_size=batch_size, shuffle=False,
-                                            num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                            num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
                 _, _, cd_srocc, _, cd_ndcg, cd_mae, cd_ccc = evaluate(model, user_cd_loader, device, PIAA=True)
 
                 if cd_srocc is not None and not np.isnan(cd_srocc):
@@ -330,7 +330,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
             user_test_ds.data = datasets_dict[genre]['test'].data[datasets_dict[genre]['test'].data['user_id'] == uid].reset_index(drop=True)
             if len(user_test_ds) > 0:
                 test_loaders_dict[genre] = DataLoader(user_test_ds, batch_size=batch_size, shuffle=False,
-                                                       num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                                       num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
                 total_test_samples += len(user_test_ds)
         if total_test_samples == 0:
             print(f"No test samples for user {uid}, skipping.")
@@ -361,7 +361,7 @@ def inference_finetune(datasets_dict, args, device, dirname, experiment_name, ba
                 if len(user_eval_ds) > 0:
                     eval_loaders_dict[target_genre] = DataLoader(
                         user_eval_ds, batch_size=batch_size, shuffle=False,
-                        num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                        num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
             if len(eval_loaders_dict) > 0:
                 cd_results = evaluate_cross_domain(model_user, eval_loaders_dict, device, genres)
                 for tg, tg_result in cd_results.items():
@@ -502,7 +502,7 @@ def evaluate_pretrain_on_val_piaa(datasets_dict_user, args, device, backbone_dic
         user_val_ds.data = datasets_dict_user[genre]['val'].data[datasets_dict_user[genre]['val'].data['user_id'] == uid].reset_index(drop=True)
         if len(user_val_ds) > 0:
             val_loaders_dict = {genre: DataLoader(user_val_ds, batch_size=batch_size, shuffle=False,
-                                                   num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
+                                                   num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)}
             genre_metrics, _ = evaluate(model, val_loaders_dict, device)
             user_metrics[uid] = genre_metrics
 
@@ -547,7 +547,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         user_test_ds.data = datasets_dict[genre]['test'].data[datasets_dict[genre]['test'].data['user_id'] == uid].reset_index(drop=True)
         if len(user_test_ds) > 0:
             test_loaders_dict = {genre: DataLoader(user_test_ds, batch_size=batch_size, shuffle=False,
-                                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)}
+                                                    num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)}
             genre_metrics, total_mae = evaluate(model, test_loaders_dict, device)
             for g, metrics in genre_metrics.items():
                 genre_srocc_list[g].append(metrics['srocc'])
@@ -589,7 +589,7 @@ def inference_pretrain(datasets_dict, args, device, dirname, experiment_name, ba
         for target_genre, ds_dict in eval_datasets_dict.items():
             eval_loaders_dict[target_genre] = DataLoader(
                 ds_dict['test'], batch_size=batch_size, shuffle=False,
-                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         cross_domain_results = evaluate_cross_domain(model, eval_loaders_dict, device, genres)
 
     from .train_common import parse_da_method as _parse_da_method

@@ -71,11 +71,11 @@ def run_main(args):
     if is_v_giaa:
         train_dataset, val_dataset, test_dataset = load_data_giaa_only(args)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                                  num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                  num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                                 num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                 num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         src_dataloaders = (train_loader, val_loader, test_loader)
 
         tgt_loader, tgt_val_loader = _build_target_loaders_giaa_only(
@@ -112,11 +112,11 @@ def run_main(args):
          test_piaa_dataset) = load_data(args)
 
         train_giaa_loader = DataLoader(train_giaa_dataset, batch_size=batch_size, shuffle=True,
-                                       num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                       num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         val_giaa_loader = DataLoader(val_giaa_dataset, batch_size=batch_size, shuffle=False,
-                                     num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                     num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         test_piaa_loader = DataLoader(test_piaa_dataset, batch_size=batch_size, shuffle=False,
-                                      num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                      num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         src_dataloaders = (train_giaa_loader, val_giaa_loader, test_piaa_loader)
 
         tgt_loader, tgt_val_loader = _build_target_loaders_full(
@@ -154,10 +154,10 @@ def _build_target_loaders_giaa_only(args, target_genre, batch_size, use_da):
         args_tgt.genre = target_genre
         tgt_train, tgt_val, _ = load_data_giaa_only(args_tgt)
         tgt_loader = DataLoader(tgt_train, batch_size=batch_size, shuffle=True,
-                                num_workers=args.num_workers, timeout=300,
+                                num_workers=args.num_workers, timeout=300 if args.num_workers else 0,
                                 collate_fn=collate_fn, drop_last=True)
         tgt_val_loader = DataLoader(tgt_val, batch_size=batch_size, shuffle=False,
-                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                    num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         return tgt_loader, tgt_val_loader
 
     eval_target = getattr(args, 'eval_target', None)
@@ -166,7 +166,7 @@ def _build_target_loaders_giaa_only(args, target_genre, batch_size, use_da):
         args_tgt.genre = eval_target
         _, tgt_val, _ = load_data_giaa_only(args_tgt)
         tgt_val_loader = DataLoader(tgt_val, batch_size=batch_size, shuffle=False,
-                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                    num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         return None, tgt_val_loader
 
     return None, None
@@ -178,10 +178,10 @@ def _build_target_loaders_full(args, target_genre, batch_size, use_da):
         args_tgt.genre = target_genre
         tgt_giaa, _, _, tgt_val_giaa, _, _, _ = load_data(args_tgt)
         tgt_loader = DataLoader(tgt_giaa, batch_size=batch_size, shuffle=True,
-                                num_workers=args.num_workers, timeout=300,
+                                num_workers=args.num_workers, timeout=300 if args.num_workers else 0,
                                 collate_fn=collate_fn, drop_last=True)
         tgt_val_loader = DataLoader(tgt_val_giaa, batch_size=batch_size, shuffle=False,
-                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                    num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         return tgt_loader, tgt_val_loader
 
     eval_target = getattr(args, 'eval_target', None)
@@ -190,7 +190,7 @@ def _build_target_loaders_full(args, target_genre, batch_size, use_da):
         args_tgt.genre = eval_target
         _, _, _, tgt_val_giaa, _, _, _ = load_data(args_tgt)
         tgt_val_loader = DataLoader(tgt_val_giaa, batch_size=batch_size, shuffle=False,
-                                    num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                    num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         return None, tgt_val_loader
 
     return None, None

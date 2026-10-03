@@ -191,14 +191,12 @@ class Interfusion_GRU(nn.Module):
         self.gru = nn.GRUCell(input_dim, input_dim)
 
     def forward(self, initial_node, internal_interaction, external_interaction):
-        num_attr = initial_node.shape[1]
-        results = []
-        for i in range(num_attr):
-            fused_node = self.gru(initial_node[:, i], None)
-            fused_node = self.gru(internal_interaction[:, i], fused_node)
-            fused_node = self.gru(external_interaction[:, i], fused_node)
-            results.append(fused_node)
-        return torch.stack(results, dim=1)
+        # The attributes share the GRU cell and do not interact, so all of them run as one batch.
+        batch_size, num_attr, dim = initial_node.shape
+        fused_node = self.gru(initial_node.reshape(-1, dim), None)
+        fused_node = self.gru(internal_interaction.reshape(-1, dim), fused_node)
+        fused_node = self.gru(external_interaction.reshape(-1, dim), fused_node)
+        return fused_node.view(batch_size, num_attr, dim)
 
 
 class PIAA_ICI_CrossDomain(nn.Module):

@@ -179,7 +179,7 @@ def run_main(args):
                 _, _, tgt_giaa_dataset, _, _, tgt_val_giaa_dataset, _ = load_data(
                     args_tgt, global_trait_encoders=global_trait_encoders, global_age_bins=global_age_bins)
                 tgt_val_loader = DataLoader(tgt_val_giaa_dataset, batch_size=args.batch_size, shuffle=False,
-                                            num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                            num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
             else:
                 tgt_val_loader = None
             best_model_path, best_state_dict = src_mod.trainer_pretrain(

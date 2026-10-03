@@ -119,18 +119,27 @@ class ImageDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    def _row(self, idx):
+        """Row `idx` of self.data as a dict. DataFrame.iloc per item dominated data loading, so the
+        rows are converted once per data frame (self.data is reassigned after __init__, hence the check)."""
+        if getattr(self, '_rows_of', None) is not self.data:
+            self._rows = self.data.to_dict('records')
+            self._rows_of = self.data
+        return self._rows[idx]
+
     def __getitem__(self, idx):
+        row = self._row(idx)
 
         sample = {
-            attribute: torch.tensor(self.data.iloc[idx][attribute], dtype=torch.int) for attribute in self.metadata
+            attribute: torch.tensor(row[attribute], dtype=torch.int) for attribute in self.metadata
         }
 
         sample.update({
-            f'{attribute}_onehot': self.one_hot_personality(self.data.iloc[idx][attribute]) for attribute in self.score_fields
+            f'{attribute}_onehot': self.one_hot_personality(row[attribute]) for attribute in self.score_fields
         })
 
         sample.update({
-            trait: torch.tensor(encoder[self.data.iloc[idx][trait]], dtype=torch.int)
+            trait: torch.tensor(encoder[row[trait]], dtype=torch.int)
             for trait, encoder in zip(self.encoded_trait_columns, self.trait_encoders)
         })
 
@@ -142,7 +151,7 @@ class ImageDataset(Dataset):
         for trait in self.encoded_trait_columns:
             del sample[trait]
 
-        sample_file = self.data.iloc[idx]['sample_file']
+        sample_file = row['sample_file']
         features = getattr(self, 'features', None)
         feature = features[sample_file] if features is not None else None
         if self.genre == 'scenery':
@@ -221,7 +230,7 @@ class ImageDataset(Dataset):
                 sample['image'] = video_tensor
 
         sample['QIP'] = self.qip_data[sample['sample_file']]
-        sample['user_id'] = self.data.iloc[idx]['user_id']
+        sample['user_id'] = row['user_id']
         return sample
 
 def create_GIAA_split_dataset(dataset, fold_id):
@@ -645,7 +654,7 @@ class Image_PIAA_HistogramDataset(ImageDataset):
         # GroupSplitData fills the memo up front; loader workers inherit it, and copy.copy subsets share it.
         memo = getattr(self, 'memo', None)
         if memo is not None:
-            row = self.data.iloc[idx]
+            row = self._row(idx)
             key = (row['user_id'], row['sample_file'])
             if key in memo:
                 return memo[key]

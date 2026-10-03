@@ -230,9 +230,9 @@ def trainer_pretrain(datasets_dict, tgt_train_dataset, tgt_val_dataset, args, de
     genre_str = domain_tag if domain_tag else genre
 
     src_loader = DataLoader(datasets_dict[genre]['train'], batch_size=batch_size, shuffle=True,
-                            drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                            drop_last=True, num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
     tgt_loader = DataLoader(tgt_train_dataset, batch_size=batch_size, shuffle=True,
-                            drop_last=True, num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                            drop_last=True, num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
 
     model = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
 
@@ -327,9 +327,9 @@ def trainer_finetune(datasets_dict, tgt_train_piaa_dataset, tgt_val_piaa_dataset
             continue
 
         src_loader = DataLoader(user_train_src, batch_size=batch_size, shuffle=True, drop_last=True,
-                                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
         tgt_loader = DataLoader(user_train_tgt, batch_size=batch_size, shuffle=True, drop_last=True,
-                                num_workers=args.num_workers, timeout=300, collate_fn=collate_fn)
+                                num_workers=args.num_workers, timeout=300 if args.num_workers else 0, collate_fn=collate_fn)
 
         model_user = build_piaa_model(num_bins, num_attr, num_pt, genres, backbone_dict, args).to(device)
         pretrained_path = pretrained_model_dict[genre]
