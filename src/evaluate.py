@@ -13,6 +13,13 @@ from .train_common import earth_mover_distance, num_bins
 _criterion_mse = nn.MSELoss()
 
 
+def _ndcg(true, pred):
+    """NDCG@10 of one user; NaN when the model diverged and predicts non-finite scores, which ndcg_score rejects."""
+    if not np.isfinite(pred).all():
+        return float('nan')
+    return ndcg_score([true], [pred], k=10)
+
+
 def evaluate(model, dataloader, device, PIAA=False, epoch: int = None, phase_name: str = "Val"):
     model.eval()
     running_emd_loss = 0.0
@@ -69,7 +76,7 @@ def evaluate(model, dataloader, device, PIAA=False, epoch: int = None, phase_nam
             if np.sum(uid_mask) > 1:
                 uid_srocc, _ = spearmanr(predicted_scores[uid_mask], true_scores[uid_mask])
                 sroccs.append(uid_srocc)
-                uid_ndcg = ndcg_score([true_scores[uid_mask]], [predicted_scores[uid_mask]], k=10)
+                uid_ndcg = _ndcg(true_scores[uid_mask], predicted_scores[uid_mask])
                 ndcgs.append(uid_ndcg)
         srocc_PIAA = np.mean(sroccs)
         ndcg_PIAA = np.mean(ndcgs) if len(ndcgs) > 0 else 0
@@ -185,7 +192,7 @@ def evaluate_piaa(model, dataloaders_dict, device, epoch: int = None, phase_name
             uid_true = true_scores[uid_mask]
             uid_srocc, _ = spearmanr(uid_pred, uid_true)
             sroccs.append(uid_srocc)
-            uid_ndcg = ndcg_score([uid_true], [uid_pred], k=10)
+            uid_ndcg = _ndcg(uid_true, uid_pred)
             ndcgs.append(uid_ndcg)
             mu_p, mu_t = uid_pred.mean(), uid_true.mean()
             var_p, var_t = uid_pred.var(), uid_true.var()
@@ -301,7 +308,7 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
             uid_pred = avg_preds[uid_mask]
             uid_true = true_scores[uid_mask]
             uid_srocc, _ = spearmanr(uid_pred, uid_true)
-            uid_ndcg = ndcg_score([uid_true], [uid_pred], k=10)
+            uid_ndcg = _ndcg(uid_true, uid_pred)
             uid_mae = float(np.mean(np.abs(uid_pred - uid_true)))
             mu_p, mu_t = uid_pred.mean(), uid_true.mean()
             var_p, var_t = uid_pred.var(), uid_true.var()
@@ -333,7 +340,7 @@ def evaluate_cross_domain(model, eval_dataloaders_dict, device, source_genres):
                 uid_pred = per_head_preds[sg][uid_mask]
                 uid_true = true_scores[uid_mask]
                 uid_srocc, _ = spearmanr(uid_pred, uid_true)
-                uid_ndcg = ndcg_score([uid_true], [uid_pred], k=10)
+                uid_ndcg = _ndcg(uid_true, uid_pred)
                 uid_mae = float(np.mean(np.abs(uid_pred - uid_true)))
                 mu_p, mu_t = uid_pred.mean(), uid_true.mean()
                 var_p, var_t = uid_pred.var(), uid_true.var()
