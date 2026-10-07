@@ -1,14 +1,14 @@
-"""Score the zero-shot LLM baselines on the group split (within-domain table).
+"""Score the LLM PIAA baselines (GPT-5.4, Qwen; 0-shot and 3-shot) on the group split (within-domain table).
 
-The LLMs rated every (user, image) pair once (src.methods.{gpt,claude,gemini},
-results in reports/exp/{model}/{genre}_piaa_results.json). Each fold's test
-users are scored on their 50 'eval' samples per domain from fine_samples.csv,
-the same samples the PIAA models are scored on, so every one of the 129 users
-is scored exactly once.
+src.methods.gpt rated each test user's 50 'eval' samples per domain from fine_samples.csv,
+the same samples the PIAA models are scored on, so every one of the 129 users is scored
+exactly once (results in reports/exp/gpt/{genre}_piaa_{k}shot.json). src.methods.qwen sends the
+same queries to Qwen via vLLM (reports/exp/qwen3.8-27b-fp8/, qwen3.5-9b/); a model without results is skipped.
 
-LLM scores are on the 1-7 scale of the prompt and ratings on 0-6, so the
-predictions are shifted by -1 before computing CCC (SCC is unaffected). As in
-src.sweep, an undefined SCC (constant prediction) counts as 0 in the mean.
+LLM scores are on the 1-7 scale of the prompt and ratings on 0-6, so the predictions
+are shifted by -1 before computing CCC (SCC is unaffected). As in src.sweep, an undefined
+SCC (constant prediction) counts as 0 in the mean. A response that is not a number in
+[1, 7] is scored as the scale midpoint 4 and counted in n_parse_failures.
 
 Usage:
     python -m src.eval_llm
@@ -23,7 +23,9 @@ from scipy.stats import spearmanr
 
 from .data import GENRES
 
-MODELS = {'gpt': 'GPT 5.4', 'claude': 'Claude Opus 4.6', 'gemini': 'Gemini 3 Flash'}
+MODELS = {'gpt_0shot': ('gpt', 0, 'GPT-5.4 (0-shot)'), 'gpt_3shot': ('gpt', 3, 'GPT-5.4 (3-shot)'),
+          'qwen27b_0shot': ('qwen3.8-27b-fp8', 0, 'Qwen3.8-27B (0-shot)'), 'qwen27b_3shot': ('qwen3.8-27b-fp8', 3, 'Qwen3.8-27B (3-shot)'),
+          'qwen9b_0shot': ('qwen3.5-9b', 0, 'Qwen3.5-9B (0-shot)'), 'qwen9b_3shot': ('qwen3.5-9b', 3, 'Qwen3.5-9B (3-shot)')}
 
 
 def _ccc(pred, true):
@@ -46,7 +48,7 @@ def _predictions(path):
     pred = {}
     for entry in results['per_sample']:
         for r in entry['ratings']:
-            pred.setdefault((int(r['user_id']), entry['sample_file']), float(r['pred_score']))
+            pred.setdefault((int(r['user_id']), entry['sample_file']), r['pred_score'])
     return results['model'], pred
 
 
@@ -65,16 +67,24 @@ def main():
     evals = fine[(fine['role'] == 'eval') & fine['user_id'].isin(test)]
 
     out = {}
-    for name, label in MODELS.items():
+    for name, (model_dir, n_shot, label) in MODELS.items():
         out[name] = {'label': label, 'summary': {}, 'per_user': {}}
         for genre in GENRES:
-            model_id, pred = _predictions(os.path.join(cli.results_dir, name, f'{genre}_piaa_results.json'))
+            path = os.path.join(cli.results_dir, model_dir, f'{genre}_piaa_{n_shot}shot.json')
+            if not os.path.exists(path):
+                print(f'{label}: {path} not found, skipped')
+                out.pop(name)
+                break
+            model_id, pred = _predictions(path)
             rows = evals[evals['genre'] == genre].merge(
                 ratings[ratings['genre'] == genre][['user_id', 'sample_id', 'sample_file', 'Aesthetic']],
                 on=['user_id', 'sample_id'], how='left')
-            rows['pred'] = [pred.get(k) for k in zip(rows['user_id'], rows['sample_file'])]
-            if rows['pred'].isna().any():
-                raise ValueError(f'{name}/{genre}: {rows["pred"].isna().sum()} eval samples have no prediction')
+            keys = list(zip(rows['user_id'], rows['sample_file']))
+            missing = sum(k not in pred for k in keys)
+            if missing:
+                raise ValueError(f'{name}/{genre}: {missing} eval samples have no prediction')
+            n_fail = sum(pred[k] is None for k in keys)
+            rows['pred'] = [4.0 if pred[k] is None else float(pred[k]) for k in keys]
 
             per_user = {}
             for uid, g in rows.groupby('user_id'):
@@ -86,11 +96,15 @@ def main():
             ccc = np.array([v['ccc'] for v in per_user.values()])
             out[name]['model'] = model_id
             out[name]['per_user'][genre] = per_user
-            out[name]['summary'][genre] = {'n_users': len(per_user), 'scc_mean': scc.mean(), 'scc_std': scc.std(),
-                                           'ccc_mean': ccc.mean(), 'ccc_std': ccc.std(),
-                                           'n_undefined_scc': int(sum(v['scc'] is None for v in per_user.values()))}
-            print(f"{label:16s} {genre:8s} n={len(per_user)} SCC {scc.mean():.3f}±{scc.std():.3f} "
-                  f"CCC {ccc.mean():.3f}±{ccc.std():.3f}")
+            # Sample std over users, as for the trained models in tab:within_domain.
+            out[name]['summary'][genre] = {'n_users': len(per_user), 'scc_mean': scc.mean(), 'scc_std': scc.std(ddof=1),
+                                           'ccc_mean': ccc.mean(), 'ccc_std': ccc.std(ddof=1),
+                                           'n_undefined_scc': int(sum(v['scc'] is None for v in per_user.values())),
+                                           'n_parse_failures': n_fail}
+            print(f"{label:16s} {genre:8s} n={len(per_user)} SCC {scc.mean():.3f}±{scc.std(ddof=1):.3f} "
+                  f"CCC {ccc.mean():.3f}±{ccc.std(ddof=1):.3f} parse failures {n_fail}")
+        if name not in out:
+            continue
         s = out[name]['summary']
         s['avg'] = {'scc': float(np.mean([s[g]['scc_mean'] for g in GENRES])),
                     'ccc': float(np.mean([s[g]['ccc_mean'] for g in GENRES]))}
