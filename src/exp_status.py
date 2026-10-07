@@ -1,4 +1,4 @@
-"""Experiment status page for the R1-6 sweep: what is done, running or not started, and on which GPU.
+"""Experiment status page for the R1-6 sweep (and the R2-1 swap control): what is done, running or not started, and on which GPU.
 
 Reads only the files src.sweep writes (results/ JSON records and logs/), so it runs with the
 system python and works on any machine that receives output/ (e.g. over Syncthing).
@@ -19,7 +19,7 @@ queue/local/ into queue/pod/.
 Usage:
     python -m src.exp_status                       # writes note/exp_status.html
     python -m src.exp_status --watch 120           # regenerate every 2 min (the page reloads itself)
-    python -m src.exp_status --pre_metric scc --html note/exp_status_pre-scc.html
+    python -m src.exp_status --pre_metric mse --html note/exp_status_pre-mse.html   # reference criterion
 """
 import argparse
 import glob
@@ -36,7 +36,7 @@ from collections import Counter, defaultdict
 # Mirrors src.sweep / src.data; kept literal so this script needs neither torch nor cv2.
 GENRES = ['art', 'fashion', 'scenery']
 DA_METHODS = ['DANN', 'DJDOT', 'JUMBOT', 'DEEPCORAL', 'CDAN', 'ALDA', 'DAREGRAM', 'RSD']
-NO_GIAA = {'DAREGRAM', 'RSD'}
+GIAA_FROM = {'DAREGRAM': 'DJDOT', 'RSD': 'DJDOT'}  # as in src.sweep
 METHODS = ['SourceOnly'] + DA_METHODS
 MODEL_TYPES = ['ICI', 'MIR']
 FOLDS = range(5)
@@ -47,7 +47,7 @@ PRE_METRICS = {'mse': ('val_loss', True), 'scc': ('val_scc', False)}  # as src.s
 # with their hostname and GPU. Records written before devices were recorded count as MAIN_HOST.
 MAIN_HOST = 'hayashi0884-Z690-S01'
 MACHINES = {MAIN_HOST: ('メイン機', '#2a78d6'), 'a156d1e4b161': ('クラウド3090', '#e07b00'),
-            'eaa4b40fa4ec': ('クラウド3090-2', '#1a9a6c')}
+            'eaa4b40fa4ec': ('クラウド3090-2', '#1a9a6c'), 'bc231cf2e2c5': ('クラウドL40S', '#b4489a')}
 PALETTE = ['#e07b00', '#1a9a6c', '#b4489a', '#7a5af0', '#c0392b']
 # Queue origin -> (host its jobs run on, jobs it runs at once). `local` is this machine, one job at a time
 # (run_sourceonly_oracle.sh); the pod's run_da.sh / run_giaa_da.sh run 5 jobs through xargs -P 5.
@@ -61,7 +61,7 @@ def parse_cli():
     parser.add_argument('--out_dir', type=str, default='output/r16', help='The sweep --out_dir')
     parser.add_argument('--html', type=str, default='note/exp_status.html')
     parser.add_argument('--n_trials', type=int, default=20)
-    parser.add_argument('--pre_metric', type=str, default='mse', choices=list(PRE_METRICS),
+    parser.add_argument('--pre_metric', type=str, default='scc', choices=list(PRE_METRICS),
                         help='Pre-stage selection metric of the chains shown, as in src.sweep')
     parser.add_argument('--running_min', type=float, default=15, help='A log newer than this counts as live')
     parser.add_argument('--eta_hours', type=float, default=12,
@@ -213,7 +213,7 @@ def chain(out_dir, fold, model_type, method, src, tgt, criterion, n_trials, pre_
 def _chain(out_dir, fold, model_type, method, src, tgt, criterion, n_trials, pre_metric, live, machines):
     sel = src if criterion == 'train_domain' else tgt
     key = f'SourceOnly_{src}' if method == 'SourceOnly' else f'{method}_{src}2{tgt}'
-    giaa_key = f'SourceOnly_{src}' if method in NO_GIAA or method == 'SourceOnly' else key
+    giaa_key = f'{GIAA_FROM[method]}_{src}2{tgt}' if method in GIAA_FROM else key
     res = os.path.join(out_dir, 'results', f'fold{fold}')
     stages = {s: {'n': 0, 'hosts': Counter(), 'running': None, 'id': None} for s in STAGES}
 
@@ -410,6 +410,255 @@ def eta_html(etas, durations, machines, n_trials):
             f'<p class="note">1 trial の所要時間: {speed}（1 段 {n_trials} trial）</p></section>')
 
 
+# ---------- R2-1 swap control (src.swap) ----------
+
+SWAP_METHOD, SWAP_CRITERION = 'DJDOT', 'oracle'
+
+
+def _swap_gaps(rec, genre):
+    """Mean over rated users of native SCC - mean swap SCC, for same-set and same-fold partners (None -> 0)."""
+    m, users, sets = rec['scc'][genre], rec['users'], rec['set']
+    val = lambda a, b: m[str(a)][str(b)] or 0.0
+    out = {}
+    for partner in ['set', 'fold']:
+        gaps = []
+        for b in users:
+            ps = [a for a in users if a != b and (partner == 'fold' or sets[str(a)] == sets[str(b)])]
+            gaps.append(val(b, b) - sum(val(a, b) for a in ps) / len(ps))
+        out[partner] = sum(gaps) / len(gaps)
+    out['native'] = sum(val(b, b) for b in users) / len(users)
+    return out
+
+
+def _swap_launchers():
+    """Model types a running run_swap_local.sh (or a chain that will start one) still has to run."""
+    pending = set()
+    for proc in glob.glob('/proc/[0-9]*'):
+        try:
+            with open(os.path.join(proc, 'cmdline'), 'rb') as f:
+                cmd = f.read().replace(b'\0', b' ').decode(errors='replace')
+            if 'run_swap_local.sh' not in cmd:
+                continue
+            pending |= set(re.findall(r'MODEL_TYPE=(\w+)', cmd))
+            with open(os.path.join(proc, 'environ'), 'rb') as f:
+                env = dict(kv.split('=', 1) for kv in f.read().decode(errors='replace').split('\0') if '=' in kv)
+            pending.add(env.get('MODEL_TYPE', 'ICI'))
+        except OSError:
+            continue
+    return pending
+
+
+def swap_cell(cli, fold, model_type, src, tgt, pending, machines):
+    base = os.path.join(cli.out_dir, 'swap', f'fold{fold}', model_type, f'{SWAP_METHOD}_{src}2{tgt}_{SWAP_CRITERION}.json')
+    rec = _read_json(base)
+    c = {'done': rec is not None, 'n': 0, 'total': 0, 'running': False, 'host': None, 'gaps': None, 'path': base}
+    if rec:
+        c['n'] = c['total'] = len(rec['users'])
+        c['host'] = (rec.get('device') or {}).get('host')
+        c['gaps'] = _swap_gaps(rec, tgt)
+        c['diag'] = (rec.get('diag_check') or {}).get('max_abs_diff_scc')
+        c['state'] = 'done'
+        return c
+    part = _read_json(base + '.partial')
+    if part:
+        c['n'], c['total'] = len(part['pred'][tgt]), len(part['users'])
+        c['host'] = (part.get('device') or {}).get('host')
+        c['running'] = time.time() - os.path.getmtime(base + '.partial') < cli.running_min * 60
+    c['state'] = 'running' if c['running'] else 'queued' if model_type in pending else 'todo'
+    return c
+
+
+def swap_cell_html(c, machines):
+    frac = c['n'] / c['total'] if c['total'] else 0.0
+    colour = machines.colour(c['host']) if c['host'] else 'transparent'
+    cls = 'bar running' if c['running'] else 'bar'
+    bar = (f'<span class="{cls}" style="--c:{colour}"><span class="fill" style="width:{frac * 100:.0f}%"></span>'
+           f'<b>{c["n"]}/{c["total"] or "–"}</b></span>')
+    tips = [f"{STATE_LABEL[c['state']]}  {c['n']}/{c['total'] or '?'} 人"]
+    if c['host']:
+        tips.append(machines.label(c['host']))
+    score = ''
+    if c['gaps']:
+        g = c['gaps']
+        score = f'<span class="scc">{g["set"]:+.3f} / {g["fold"]:+.3f}</span>'
+        tips.append(f"ターゲット SCC 本来 {g['native']:.4f}  本来−入れ替え: set {g['set']:+.4f} / fold {g['fold']:+.4f}")
+        if c.get('diag') is not None:
+            tips.append(f"対角の再現 max|dSCC| = {c['diag']:.1e}")
+    title = html.escape('\n'.join(tips))
+    return f'<td class="cell {c["state"]}" title="{title}"><div class="bars">{bar}</div>{score}</td>'
+
+
+def swap_eta(cli, cells):
+    """Remaining users x median seconds per user (finished jobs: log start -> record) / jobs at once."""
+    per_user = []
+    for c in cells.values():
+        if not c['done']:
+            continue
+        name = os.path.basename(c['path'])[:-len('.json')]
+        fold_dir = os.path.basename(os.path.dirname(os.path.dirname(c['path'])))
+        logs = sorted(glob.glob(os.path.join(cli.out_dir, 'swap', 'logs', fold_dir, f'{name}_*.log')))
+        if logs:
+            start = time.mktime(time.strptime(logs[-1].rsplit('_', 1)[1][:-len('.log')], '%Y%m%d-%H%M%S'))
+            seconds = os.path.getmtime(c['path']) - start
+            if 0 < seconds < 6 * 3600:
+                per_user.append(seconds / c['total'])
+    left = sum((c['total'] or 26) - c['n'] for c in cells.values() if c['state'] in ('running', 'queued'))
+    if not per_user or not left:
+        return None, left
+    return left * statistics.median(per_user) / 4, left
+
+
+def swap_section(cli, machines):
+    pending = _swap_launchers()
+    directions = [(s, t) for s in GENRES for t in GENRES if s != t]
+    cells = {(mt, f, s, t): swap_cell(cli, f, mt, s, t, pending, machines)
+             for mt in MODEL_TYPES for f in FOLDS for s, t in directions}
+    head = ''.join(f'<th colspan="5" class="mt">{mt}</th>' for mt in MODEL_TYPES)
+    sub = ''.join(f'<th class="fold">f{f}</th>' for _ in MODEL_TYPES for f in FOLDS)
+    body = []
+    for i, (s, t) in enumerate(directions):
+        first = f'<th class="method" rowspan="{len(directions)}">DeepJDOT</th>' if i == 0 else ''
+        tds = ''.join(swap_cell_html(cells[mt, f, s, t], machines) for mt in MODEL_TYPES for f in FOLDS)
+        body.append(f'<tr>{first}<th class="dir">{s} → {t}</th>{tds}</tr>')
+    counts = Counter(c['state'] for c in cells.values())
+    pills = ''.join(f'<span class="pill {st}">{STATE_LABEL[st]} <b>{counts.get(st, 0)}</b></span>'
+                    for st in ['done', 'running', 'queued', 'todo'])
+    means = []
+    for mt in MODEL_TYPES:
+        done = [c['gaps'] for (m, *_), c in cells.items() if m == mt and c['gaps']]
+        if done:
+            avg = lambda k: sum(g[k] for g in done) / len(done)
+            means.append(f"{mt}（{len(done)}/30 ジョブ）: 本来 {avg('native'):.3f}、本来−入れ替え "
+                         f"set <b>{avg('set'):+.3f}</b> / fold <b>{avg('fold'):+.3f}</b>")
+    seconds, left = swap_eta(cli, cells)
+    eta = (f"残り {left} 人ぶん ・ 完走予想 <b>{time.strftime('%m/%d %H:%M', time.localtime(time.time() + seconds))}</b>"
+           f"（4 並列、終わったジョブの 1 人あたり所要時間の中央値から）") if seconds else ''
+    return (f'<section><h2>R2-1 入れ替え統制 ・ DeepJDOT（oracle）</h2>'
+            f'<p class="note">テストユーザーを選択済みの設定で fine-tune し直し、各ユーザーのモデル（属性もその人）で同じ fold の'
+            f'全テストユーザーの評価画像を予測。バー = fine-tune を終えたユーザー数。数字 = ターゲット SCC の'
+            f'「本来 − 入れ替え」を評定者で平均（左: 同じ set の相手、右: 同じ fold の相手）。</p>'
+            f'<div class="summary">{pills}<span class="total">全 {len(cells)} ジョブ</span> {eta}</div>'
+            + (f'<p class="note">{" ・ ".join(means)}（fold・方向の単純平均。検定は python -m src.swap summary）</p>' if means else '')
+            + f'<div class="scroll"><table><thead><tr><th rowspan="2">手法</th><th rowspan="2">方向</th>{head}</tr>'
+            f'<tr>{sub}</tr></thead><tbody>{"".join(body)}</tbody></table></div></section>')
+
+
+# ---------- LLM baselines (src.methods.gpt / src.methods.qwen) ----------
+
+# (results dir under reports/exp, label, where it runs, run_qwen.sh log pulled by output/r16/pull_qwen.sh)
+LLM_RUNS = [('gpt', 'GPT-5.4', None, None),
+            ('qwen3.8-27b-fp8', 'Qwen3.8-27B', 'bc231cf2e2c5', 'output/r16/qwen_l40s.log'),
+            ('qwen3.5-9b', 'Qwen3.5-9B', 'bc231cf2e2c5', None)]
+LLM_CELLS = [(task, shot, g) for task in ['giaa', 'piaa'] for shot in [0, 3] for g in GENRES]
+# Labels of the rows in the scorers' outputs (src.giaa_backbone table, src.eval_llm).
+LLM_SCORES = {'giaa': 'output/r16/giaa_backbone.json', 'piaa': 'output/r16/llm_table5.json'}
+
+
+def _llm_log(path):
+    """Runs started by run_qwen.sh: [(start epoch, task, genre, shot)], and whether it finished.
+    The pod's clock is UTC."""
+    import calendar
+    starts, finished = [], False
+    for line in open(path, errors='replace'):
+        m = re.match(r'=== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (\S+)(?: (\w+) (\w+) (\d)-shot| all done)', line)
+        if not m:
+            continue
+        t = calendar.timegm(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
+        if m.group(3):
+            starts.append((t, m.group(3), m.group(4), int(m.group(5))))
+        else:
+            finished = True
+    return starts, finished
+
+
+def _llm_scores(task, label):
+    rec = _read_json(LLM_SCORES[task]) or {}
+    if task == 'giaa':
+        return {g: f"EMD {v['emd_mean']:.3f} / SCC {v['scc_mean']:.3f}" for g, v in rec.get(label, {}).items() if v}
+    row = next((v for v in rec.values() if v.get('label') == label), {})  # src.eval_llm keys rows by name
+    return {g: f"SCC {v['scc_mean']:.3f} / CCC {v['ccc_mean']:.3f}" for g, v in row.get('summary', {}).items()
+            if g in GENRES}
+
+
+def llm_section(cli, machines):
+    totals = {}
+    for task, shot, g in LLM_CELLS:  # GPT-5.4's query counts, the same for every model
+        r = _read_json(os.path.join('reports/exp/gpt', f'{g}_{task}_{shot}shot.json'))
+        totals[task, shot, g] = r['n_queries'] if r else None
+    rows, etas = [], []
+    for model_dir, label, host, log in LLM_RUNS:
+        starts, finished = _llm_log(log) if log and os.path.exists(log) else ([], False)
+        launched = bool(starts) and not finished
+        cells, rate = {}, {}
+        for i, (t0, task, g, shot) in enumerate(starts):  # seconds per query of each finished run
+            end = starts[i + 1][0] if i + 1 < len(starts) else None
+            if end and totals.get((task, shot, g)):
+                rate.setdefault((task, shot), []).append((end - t0) / totals[task, shot, g])
+        for task, shot, g in LLM_CELLS:
+            path = os.path.join('reports/exp', model_dir, f'{g}_{task}_{shot}shot.json')
+            r = _read_json(path)
+            c = {'n': r['n_done'] if r else 0, 'total': (r or {}).get('n_queries') or totals[task, shot, g],
+                 'fail': r['n_parse_failures'] if r else 0}
+            done = r is not None and c['n'] == c['total']
+            fresh = r is not None and time.time() - os.path.getmtime(path) < cli.running_min * 60
+            current = launched and starts[-1][1:] == (task, g, shot)
+            c['state'] = ('done' if done else 'running' if fresh or current else 'queued' if launched else 'todo')
+            cells[task, shot, g] = c
+        if launched:
+            left = 0.0
+            for (task, shot, g), c in cells.items():
+                if c['state'] in ('running', 'queued'):
+                    per = (rate.get((task, shot)) or rate.get(('giaa', shot)) or sum(rate.values(), []) or [None])
+                    if per[0] is None:
+                        left = None
+                        break
+                    left += (c['total'] - c['n']) * statistics.median(per)
+            if left is not None:
+                etas.append(f"{label}（{html.escape(machines.label(host))}）完走予想 "
+                            f"<b>{time.strftime('%m/%d %H:%M', time.localtime(time.time() + left))}</b>")
+        scores = {(task, shot): _llm_scores(task, f'{label} ({shot}-shot)') for task in ['giaa', 'piaa'] for shot in [0, 3]}
+        rows.append((label, host, cells, scores))
+
+    head = ''.join(f'<th colspan="3" class="mt">{task.upper()} {shot}-shot</th>' for task in ['giaa', 'piaa'] for shot in [0, 3])
+    sub = ''.join(f'<th class="fold">{g}</th>' for _ in range(4) for g in GENRES)
+    body, counts = [], Counter()
+    for label, host, cells, scores in rows:
+        if not any(c['n'] or c['state'] != 'todo' for c in cells.values()):
+            continue
+        where = html.escape(machines.label(host)) if host else 'OpenAI API'
+        tds = []
+        for key in LLM_CELLS:
+            c, (task, shot, g) = cells[key], key
+            counts[c['state']] += 1
+            frac = c['n'] / c['total'] if c['total'] else 0.0
+            colour = machines.colour(host) if host else '#888'
+            cls = 'bar running' if c['state'] == 'running' else 'bar'
+            tips = [f"{STATE_LABEL[c['state']]}  {c['n']}/{c['total'] or '?'} 件", where]
+            if c['fail']:
+                tips.append(f"パース失敗 {c['fail']} 件（一様分布 / 中点 4 として採点）")
+            score = scores[task, shot].get(g)
+            if score:
+                tips.append(score)
+            fail = f'<span class="scc">失敗 {c["fail"]}</span>' if c['fail'] else ''
+            val = f'<span class="scc">{score.split(" / ")[1]}</span>' if score and c['state'] == 'done' else ''
+            tds.append(f'<td class="cell {c["state"]}" title="{html.escape(chr(10).join(tips))}"><div class="bars">'
+                       f'<span class="{cls}" style="--c:{colour}"><span class="fill" style="width:{frac * 100:.0f}%"></span>'
+                       f'<b>{c["n"]}/{c["total"] or "–"}</b></span></div>{val}{fail}</td>')
+        body.append(f'<tr><th class="method">{html.escape(label)}<br><small>{where}</small></th>{"".join(tds)}</tr>')
+    pills = ''.join(f'<span class="pill {st}">{STATE_LABEL[st]} <b>{counts.get(st, 0)}</b></span>'
+                    for st in ['done', 'running', 'queued', 'todo'])
+    eta = ' ・ '.join(etas)
+    return (f'<section><h2>LLM ベースライン ・ GPT-5.4 / Qwen（オープンウェイト）</h2>'
+            f'<p class="note">同じクエリ（プロンプト・k-shot 例・224px 画像・JSON schema・temperature 0）を GPT-5.4 と、vLLM で'
+            f'動かす Qwen（thinking オフ）に送る。バー = 回答済みクエリ数。数字 = 採点済みのスコア（GIAA: SCC、PIAA: CCC。'
+            f'詳細はカーソル）。L40S の結果は output/r16/pull_qwen.sh が 5 分ごとに取得。</p>'
+            f'<div class="summary">{pills}<span class="total">全 {sum(counts.values())} 本</span> {eta}</div>'
+            f'<div class="scroll"><table><thead><tr><th rowspan="2">モデル</th>{head}</tr><tr>{sub}</tr></thead>'
+            f'<tbody>{"".join(body)}</tbody></table></div>'
+            f'<p class="note">完走予想: 残りクエリ数 × 終わった実行の 1 件あたり所要時間（同じタスク・shot、なければ同じ shot の GIAA）の中央値。</p>'
+            f'</section>')
+
+
 # ---------- html ----------
 
 STATE_LABEL = {'done': '完了', 'running': '実行中', 'queued': '実行予約', 'todo': '未実行'}
@@ -495,6 +744,8 @@ def build(cli):
 
     durations = stage_durations(cli.out_dir, cli.eta_hours)
     body = eta_html(queue_etas(cli, queue, durations), durations, machines, cli.n_trials)
+    body += llm_section(cli, machines)
+    body += swap_section(cli, machines)
     body += ''.join(f'<section><h2>{html.escape(t)}</h2><p class="note">{html.escape(n)}</p>'
                    f'{summary_html(r, cli.n_trials)}{table_html(r, cli.n_trials, machines)}</section>'
                    for t, n, r in sections)
