@@ -4,8 +4,8 @@ For one fold, method and direction (source -> target) the stages run in order,
 each starting from the configuration selected in the previous stage:
 
     giaa  NIMA on train users' score histograms   selected by EMD on val users' images
-    pre   PIAA on train users' ratings            selected by MSE on val users' ratings
-                                                  (or mean per-user SCC on them, --pre_metric scc)
+    pre   PIAA on train users' ratings            selected by mean per-user SCC on val users' ratings
+                                                  (or by MSE on them, --pre_metric mse; for reference only)
     fine  per-user fine-tuning of the val users   selected by mean per-user SCC on their eval samples
 
 and the test users are then fine-tuned with the selected configuration and
@@ -23,13 +23,14 @@ reaches training. Fine-stage adaptation uses train-group target images paired
 with the fine-tuned user's traits (never that user's own target samples).
 
 Methods: SourceOnly, TargetOnly and the UDA methods. DAREGRAM and RSD have no
-GIAA stage and start from Source-Only's selected NIMA. TargetOnly is Source-Only
+GIAA stage and start from DeepJDOT's selected NIMA for the same direction (the
+UDA method with the best val SCC in the GIAA stage). TargetOnly is Source-Only
 trained and selected on the target domain.
 
 Results are cached per trial, so an interrupted run resumes where it stopped and
 chains that share a stage (e.g. Source-Only for two targets) reuse its trials.
-Only the best checkpoint per domain of interest is kept (in pre, both the
-best-MSE and the best-SCC ones).
+Only the best checkpoint per domain of interest is kept (in pre, by the
+--pre_metric in use).
 
 Outputs go under --out_dir (default output/r16):
     results/fold{k}/      per-trial JSON records and final/ (selected configs, test SCC and CCC)
@@ -67,7 +68,7 @@ from .search_space import sample_hparams
 from .train_common import NIMA, build_piaa_model, load_weights, num_bins
 
 DA_METHODS = ['DANN', 'DJDOT', 'JUMBOT', 'DEEPCORAL', 'CDAN', 'ALDA', 'DAREGRAM', 'RSD']
-NO_GIAA = {'DAREGRAM', 'RSD'}
+GIAA_FROM = {'DAREGRAM': 'DJDOT', 'RSD': 'DJDOT'}  # methods without a GIAA stage reuse this method's
 CRITERIA = ['train_domain', 'oracle']
 PRE_METRICS = {'mse': ('val_loss', True), 'scc': ('val_scc', False)}  # record field, minimize
 SEED = 42  # every training run (each trial, and each user's fine-tuning) starts from this seed
@@ -83,8 +84,8 @@ def parse_cli():
     parser.add_argument('--n_trials', type=int, default=20, help='Configurations per stage, common to all methods')
     parser.add_argument('--search_seed', type=int, default=0)
     parser.add_argument('--criteria', type=str, nargs='+', default=CRITERIA, choices=CRITERIA)
-    parser.add_argument('--pre_metric', type=str, default='mse', choices=list(PRE_METRICS),
-                        help='Pre-stage selection metric; both are recorded per trial, so scc reuses the pre trials')
+    parser.add_argument('--pre_metric', type=str, default='scc', choices=list(PRE_METRICS),
+                        help='Pre-stage selection metric; both are recorded per trial, so either reuses the pre trials')
     parser.add_argument('--no_feature_cache', action='store_true',
                         help='Feed augmented images to the frozen backbone instead of cached features (all stages)')
     parser.add_argument('--stop_after', type=str, default=None, choices=['giaa', 'pre', 'fine'],
@@ -295,7 +296,7 @@ class Sweep:
                 record = self._run_pre(key, giaa, t)
                 _write_json(path, record)
             records.append(record)
-            self._prune(records, self.eval_genres(key), [('val_loss', True), ('val_scc', False)])
+            self._prune(records, self.eval_genres(key), [PRE_METRICS[self.cli.pre_metric]])
         return records
 
     def _run_pre(self, key, giaa, t):
@@ -450,7 +451,7 @@ class Sweep:
         """
         sel = src if criterion == 'train_domain' else tgt
         key = ('SourceOnly', src, None) if method == 'SourceOnly' else (method, src, tgt)
-        giaa_key = ('SourceOnly', src, None) if method in NO_GIAA else key
+        giaa_key = (GIAA_FROM[method], src, tgt) if method in GIAA_FROM else key
 
         giaa_records = self.giaa_trials(giaa_key)
         giaa = _best(giaa_records, 'val_loss', sel, minimize=True)
@@ -483,7 +484,7 @@ class Sweep:
 
     def run(self):
         cli = self.cli
-        suffix = '' if cli.pre_metric == 'mse' else f'_pre-{cli.pre_metric}'
+        suffix = '' if cli.pre_metric == 'scc' else f'_pre-{cli.pre_metric}'
         if cli.method == 'TargetOnly':
             # Source-Only trained and selected on the target domain; one criterion.
             result = self.run_chain('SourceOnly', cli.target, None, 'train_domain')
