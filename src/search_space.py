@@ -27,6 +27,10 @@ STAGES = ['giaa', 'pre', 'fine']
 
 # Fixed per stage (not searched). pre uses 256 (cached backbone features make 128 step-bound).
 BATCH_SIZE = {'giaa': 32, 'pre': 256, 'fine': 16}
+# RSD compares the subspaces spanned by a batch, which needs b well below the feature dimension (64): with
+# b > 32 the two subspaces must intersect, principal angles hit 0 and the SVD backward is NaN. The original
+# uses b = 36 with 512-d features, and DARE-GRAM (Sec. 3.3) points out this drawback of RSD for b >= p.
+BATCH_SIZE_METHOD = {'RSD': {'pre': 32}}
 NUM_EPOCHS = {'giaa': 20, 'pre': 20, 'fine': 20}
 
 COMMON = {'lr': ('log', 1e-7, 1e-2)}
@@ -102,6 +106,6 @@ def sample_hparams(method, stage, trial, seed=0):
         hp['da_schedule_epochs'] = NUM_EPOCHS[stage]
     if method == 'RSD':
         hp['rsd_gamma'] = hp['rsd_beta'] * RSD_GAMMA_RATIO
-    hp['batch_size'] = BATCH_SIZE[stage]
+    hp['batch_size'] = BATCH_SIZE_METHOD.get(method, {}).get(stage, BATCH_SIZE[stage])
     hp['num_epochs'] = NUM_EPOCHS[stage]
     return hp

@@ -13,39 +13,54 @@ from ..train_common import build_piaa_model, load_weights, num_bins, save_weight
 from ..data import collate_fn
 
 
-def _daregram_losses(Z_s, Z_t, T=0.95):
-    Zs = Z_s.float()
-    Zt = Z_t.float()
+def _diverged(Z_s, Z_t):
+    """NaN losses tied to the graph: a diverged model (non-finite features, or an SVD that fails on them) gets
+    non-finite gradients, so GradScaler skips the step as for any other method and the trial ends with NaN
+    metrics instead of an exception."""
+    nan = (Z_s.float().sum() + Z_t.float().sum()) * float('nan')
+    return nan, nan, 0
 
-    G_s = Zs.t() @ Zs
-    G_t = Zt.t() @ Zt
 
-    U_s, S_s, Vh_s = torch.linalg.svd(G_s, full_matrices=False)
-    U_t, S_t, Vh_t = torch.linalg.svd(G_t, full_matrices=False)
+def _daregram_losses(Z_s, Z_t, T=0.9):
+    """DARE_GRAM_LOSS of the official code (ismailnejjar/DARE-GRAM), split into its two terms.
 
-    def _select_k(S):
-        total = S.sum().clamp_min(1e-12)
-        cum = torch.cumsum(S, dim=0) / total
-        k = int((cum < T).sum().item()) + 1
-        return max(1, min(k, S.numel()))
+    Only singular values enter the gradient and the pseudo-inverse is torch.linalg.pinv, so the loss stays
+    finite when the batch is smaller than the feature dimension (rank-deficient Gram matrix). Returns the
+    angle term ||1 - cos||_1 / (p + 1), the scale term ||lambda_s[:k] - lambda_t[:k]||_2 / k, and k.
+    """
+    b, p = Z_s.shape
+    if not (torch.isfinite(Z_s).all() and torch.isfinite(Z_t).all()):
+        return _diverged(Z_s, Z_t)
+    ones = torch.ones(b, 1, device=Z_s.device)
+    A = torch.cat((ones, Z_s.float()), 1)
+    B = torch.cat((ones, Z_t.float()), 1)
 
-    k_s = _select_k(S_s)
-    k_t = _select_k(S_t)
-    k = max(k_s, k_t)
+    cov_A = A.t() @ A
+    cov_B = B.t() @ B
 
-    eps = 1e-8
-    inv_s = torch.zeros_like(S_s)
-    inv_s[:k] = 1.0 / (S_s[:k] + eps)
-    G_s_pinv = (U_s[:, :k] * inv_s[:k].unsqueeze(0)) @ Vh_s[:k]
+    try:
+        L_A = torch.linalg.svdvals(cov_A)
+        L_B = torch.linalg.svdvals(cov_B)
+    except torch.linalg.LinAlgError:
+        return _diverged(Z_s, Z_t)
 
-    inv_t = torch.zeros_like(S_t)
-    inv_t[:k] = 1.0 / (S_t[:k] + eps)
-    G_t_pinv = (U_t[:, :k] * inv_t[:k].unsqueeze(0)) @ Vh_t[:k]
+    eigen_A = torch.cumsum(L_A.detach(), dim=0) / L_A.sum()
+    eigen_B = torch.cumsum(L_B.detach(), dim=0) / L_B.sum()
+    T_A = eigen_A[1].detach() if eigen_A[1] > T else T
+    T_B = eigen_B[1].detach() if eigen_B[1] > T else T
+    index_A = torch.argwhere(eigen_A.detach() <= T_A)[-1]
+    index_B = torch.argwhere(eigen_B.detach() <= T_B)[-1]
+    k = int(max(index_A, index_B)[0])
 
-    cos_sim = F.cosine_similarity(G_s_pinv, G_t_pinv, dim=0)
-    L_cos = (1.0 - cos_sim).abs().sum()
+    try:
+        G_s_pinv = torch.linalg.pinv(cov_A, rtol=(L_A[k] / L_A[0]).detach())
+        G_t_pinv = torch.linalg.pinv(cov_B, rtol=(L_B[k] / L_B[0]).detach())
+    except torch.linalg.LinAlgError:
+        return _diverged(Z_s, Z_t)
 
-    L_scale = torch.norm(S_s[:k] - S_t[:k], p=2)
+    cos_sim = F.cosine_similarity(G_s_pinv, G_t_pinv, dim=0, eps=1e-6)
+    L_cos = torch.dist(torch.ones(p + 1, device=Z_s.device), cos_sim, p=1) / (p + 1)
+    L_scale = torch.dist(L_A[:k], L_B[:k]) / k
 
     return L_cos, L_scale, k
 
@@ -55,7 +70,7 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, optimizer, scaler, devi
     model.train()
     alpha_cos = getattr(args, 'daregram_alpha_cos', 0.1)
     gamma_scale = getattr(args, 'daregram_gamma_scale', 0.1)
-    T = getattr(args, 'daregram_T', 0.95)
+    T = getattr(args, 'daregram_T', 0.9)
 
     running_L_y = running_L_cos = running_L_scale = 0.0
     total_batches = 0

@@ -13,15 +13,26 @@ from ..train_common import build_piaa_model, load_weights, num_bins, save_weight
 from ..data import collate_fn
 
 
+def _diverged(*features):
+    """NaN losses tied to the graph: a diverged model gets non-finite gradients, so GradScaler skips the step
+    as it does for any other method, and the trial ends with NaN metrics instead of an SVD exception."""
+    nan = sum(f.float().sum() for f in features) * float('nan')
+    return nan, nan
+
+
 def compute_rsd_bmp(feature_source, feature_target, eps=1e-8):
+    if not (torch.isfinite(feature_source).all() and torch.isfinite(feature_target).all()):
+        return _diverged(feature_source, feature_target)
     F_s = feature_source.float().t()
     F_t = feature_target.float().t()
 
-    U_s, _, _ = torch.linalg.svd(F_s, full_matrices=False)
-    U_t, _, _ = torch.linalg.svd(F_t, full_matrices=False)
-
-    M = U_s.t() @ U_t
-    P_s, cos_theta, P_t_h = torch.linalg.svd(M, full_matrices=False)
+    try:
+        U_s, _, _ = torch.linalg.svd(F_s, full_matrices=False)
+        U_t, _, _ = torch.linalg.svd(F_t, full_matrices=False)
+        M = U_s.t() @ U_t
+        P_s, cos_theta, P_t_h = torch.linalg.svd(M, full_matrices=False)
+    except torch.linalg.LinAlgError:
+        return _diverged(feature_source, feature_target)
     P_t = P_t_h.t()
 
     cos_sq = cos_theta.pow(2).clamp(max=1.0)

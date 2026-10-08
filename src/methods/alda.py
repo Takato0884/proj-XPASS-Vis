@@ -119,7 +119,9 @@ def _train_one_epoch(model, src_loader, tgt_loader, optimizer, scaler, device, a
 
             with autocast('cuda', enabled=False):
                 c_adv = _compute_corrected_label(xi_adv.float(), label_all_onehot.float())
-                c_adv_clamped = c_adv.clamp(min=1e-7, max=1.0 - 1e-7)
+                # A diverged discriminator yields NaN, which trips binary_cross_entropy's device-side
+                # range assert and kills the process; map it into range so the trial ends with NaN metrics.
+                c_adv_clamped = torch.nan_to_num(c_adv, nan=0.5).clamp(min=1e-7, max=1.0 - 1e-7)
                 L_Adv_src = F.binary_cross_entropy(c_adv_clamped[:n_src], y_s_onehot.float())
                 L_Adv_tgt = F.binary_cross_entropy(c_adv_clamped[n_src:], u_tgt.float())
                 L_Adv = L_Adv_src + L_Adv_tgt
@@ -308,7 +310,9 @@ def _train_one_epoch_piaa(model, src_loader, tgt_loader, discriminator, grl,
 
             with autocast('cuda', enabled=False):
                 c_adv = _compute_corrected_label(xi_adv.float(), label_all_onehot.float())
-                c_adv_clamped = c_adv.clamp(min=1e-7, max=1.0 - 1e-7)
+                # A diverged discriminator yields NaN, which trips binary_cross_entropy's device-side
+                # range assert and kills the process; map it into range so the trial ends with NaN metrics.
+                c_adv_clamped = torch.nan_to_num(c_adv, nan=0.5).clamp(min=1e-7, max=1.0 - 1e-7)
                 L_Adv_src = F.binary_cross_entropy(c_adv_clamped[:n_src], y_s_onehot.float())
                 L_Adv_tgt = F.binary_cross_entropy(c_adv_clamped[n_src:], u_tgt.float())
                 L_Adv = L_Adv_src + L_Adv_tgt
